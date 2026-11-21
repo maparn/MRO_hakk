@@ -99,13 +99,19 @@ def main() -> int:
 
     python = sys.executable
     columns = config["stat_columns"]
+    rules = config.get("business_rules", {})
+    aliases = rules.get("unit_aliases", {})
+    alias_arguments = [item for pair in aliases.items() for item in ("--unit-alias", f"{pair[0]}={pair[1]}")]
     if args.run_tests:
         run([python, "-B", "-m", "unittest", "discover", "-s", "tests", "-q"])
     run([python, "-B", "scripts/sorter.py", "--stat", str(inputs["stat"]),
          "--uom", str(inputs["uom"]), "--amos", str(inputs["amos"]),
          "--part-col", str(columns["part_number"]), "--unit-col", str(columns["unit"]),
          "--quantity-col", str(columns["quantity"]), "--task-card-col", str(columns["task_card"]),
-         "--reference-col", str(columns["reference"]), "--output", str(output)])
+         "--reference-col", str(columns["reference"]),
+         "--historical-sheet", str(rules.get("historical_sheet", "AVG")),
+         "--fallback-markup", str(rules.get("fallback_markup_percent", 20)),
+         *alias_arguments, "--output", str(output)])
 
     print(f"\nVALMIS. Uuendatud raport: {output}")
     return 0

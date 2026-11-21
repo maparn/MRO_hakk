@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+from decimal import Decimal
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
@@ -20,11 +21,11 @@ from openpyxl.utils import get_column_letter
 if __package__:
     from .amos_prepare import AMOS_FIELDS, open_records, parse_price
     from .report_io import literal_cell, save_report, validate_output
-    from .uom_rules import annotate_rules, normalize_key as key, rule_signature
+    from .uom_rules import annotate_rules, normalize_key as key, numeric_factor, rule_signature
 else:
     from amos_prepare import AMOS_FIELDS, open_records, parse_price
     from report_io import literal_cell, save_report, validate_output
-    from uom_rules import annotate_rules, normalize_key as key, rule_signature
+    from uom_rules import annotate_rules, normalize_key as key, numeric_factor, rule_signature
 
 PROJECT = Path(__file__).resolve().parents[1]
 STAT_FILENAME = "STAT_INITIAL - Copy.xlsx"
@@ -61,6 +62,8 @@ def read_stat(path: Path, part_col: int, unit_col: int, *, quantity_col: int | N
         sheet.reset_dimensions()
         rows = []
         width = 0
+        current_task_card = None
+        current_reference = None
         for row_no, cells in enumerate(sheet.iter_rows(values_only=True), 1):
             width = max(width, len(cells))
             if not any(c is not None and str(c).strip() for c in cells):
@@ -71,9 +74,15 @@ def read_stat(path: Path, part_col: int, unit_col: int, *, quantity_col: int | N
             partno, unit = cell(part_col), cell(unit_col)
             if key(partno) in STAT_PART_HEADERS and key(unit) in STAT_UNIT_HEADERS:
                 continue
+            task_card = cell(task_card_col or 3)
+            reference = cell(reference_col)
+            if key(task_card):
+                current_task_card = task_card
+            if key(reference):
+                current_reference = reference
             rows.append({"row": row_no, "partno": partno, "part_key": key(partno),
                          "unit": unit, "unit_key": key(unit), "stat_quantity": cell(quantity_col or 8),
-                         "task_card": cell(task_card_col or 3), "reference": cell(reference_col)})
+                         "task_card": current_task_card, "reference": current_reference})
         if not rows:
             raise ValueError(f"STAT lehel '{STAT_SHEET}' puuduvad andmeread.")
         if max(part_col, unit_col, *context_cols) > width:
@@ -201,8 +210,156 @@ def amos_evidence(index, part):
     return [status, None, None, None, None, None, None]
 
 
+def parse_unit_aliases(items):
+    aliases = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"Ühiku alias peab olema kujul LT=L: {item}")
+        source, target = (key(value) for value in item.split("=", 1))
+        if not source or not target:
+            raise ValueError(f"Ühiku alias peab sisaldama kahte ühikut: {item}")
+        aliases[source] = target
+    return aliases
+
+
+def read_historical_avg(path: Path, sheet_name: str):
+    """Read the historical service average keyed by Task Card."""
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            return {}
+        sheet = wb[sheet_name]
+        sheet.reset_dimensions()
+        iterator = sheet.iter_rows(values_only=True)
+        header = next(iterator, ())
+        names = [key(value).replace(" ", "").lower() for value in header]
+        if "taskcard" not in names or "avg" not in names:
+            raise ValueError(f"{sheet_name}: oodatud veerud TaskCard ja avg puuduvad")
+        task_index, avg_index = names.index("taskcard"), names.index("avg")
+        result = {}
+        for row_no, cells in enumerate(iterator, 2):
+            task_card = key(cells[task_index] if task_index < len(cells) else None)
+            value = cells[avg_index] if avg_index < len(cells) else None
+            amount = numeric_factor(value)
+            if not task_card or amount is None or amount < 0:
+                continue
+            if task_card in result and result[task_card] != amount:
+                raise ValueError(f"{sheet_name}: Task Card {task_card} ajalooline AVG kordub erineva väärtusega")
+            result[task_card] = amount
+        return result
+    finally:
+        wb.close()
+
+
+def calculate_line(stat, uoms, amos_index, aliases):
+    """Calculate one material line in EUR without guessing missing business inputs."""
+    result = {
+        "effective_stat_unit": aliases.get(stat["unit_key"], stat["unit_key"]),
+        "converted_quantity": None,
+        "conversion_rate": None,
+        "conversion_base": None,
+        "conversion_status": "NOT_CALCULATED",
+        "unit_price_eur": None,
+        "price_source": "AMOS_AVG_PRICE",
+        "line_total_eur": None,
+        "calculation_status": "NOT_CALCULATED",
+        "avg_price_state": None,
+    }
+    if amos_index is None:
+        result["calculation_status"] = "AMOS_NOT_REQUESTED"
+        return result
+    amos_rows = amos_index.get(stat["part_key"], [])
+    if len(amos_rows) != 1:
+        result["calculation_status"] = "AMOS_MULTIPLE" if amos_rows else "AMOS_NOT_FOUND"
+        return result
+    amos_row = amos_rows[0]
+    price, price_state = parse_price(amos_row["avg_price"])
+    result["avg_price_state"] = price_state
+    if price_state == "ZERO":
+        result["calculation_status"] = "AVG_PRICE_ZERO_SERVICE_FALLBACK"
+        return result
+    if price_state != "POSITIVE":
+        result["calculation_status"] = f"AVG_PRICE_{price_state}"
+        return result
+
+    quantity = numeric_factor(stat.get("stat_quantity"))
+    if quantity is None or quantity < 0:
+        result["calculation_status"] = "MISSING_OR_INVALID_QUANTITY"
+        return result
+    source_unit = result["effective_stat_unit"]
+    target_unit = key(amos_row["measure_unit"])
+    if not source_unit or not target_unit:
+        result["calculation_status"] = "MISSING_UNIT"
+        return result
+    if source_unit == target_unit:
+        converted = quantity
+        result.update(conversion_rate=1.0, conversion_base=1.0,
+                      conversion_status="SAME_UNIT_OR_ALIAS")
+    else:
+        matching = [
+            row for row in uoms
+            if not row["rule_issues"]
+            and key(row["external"]) == source_unit
+            and key(row["internal"]) == target_unit
+        ]
+        if len(matching) != 1:
+            result["calculation_status"] = "AMBIGUOUS_CONVERSION" if matching else "NO_CONVERSION_RULE"
+            return result
+        rule = matching[0]
+        rate = numeric_factor(rule["rate"])
+        base = numeric_factor(rule["exchange_base"])
+        converted = quantity * rate / base
+        result.update(conversion_rate=float(rate), conversion_base=float(base),
+                      conversion_status="UOM_RULE_APPLIED")
+
+    total = converted * Decimal(str(price))
+    result.update(converted_quantity=float(converted), unit_price_eur=price,
+                  line_total_eur=float(total), calculation_status="OK")
+    return result
+
+
+def build_service_summary(details, historical_avg, fallback_markup):
+    services = defaultdict(list)
+    for stat, calculation in details:
+        services[key(stat.get("task_card"))].append((stat, calculation))
+    rows = []
+    resolved_total = Decimal("0")
+    for task_card, entries in services.items():
+        reference = next((stat.get("reference") for stat, _ in entries if key(stat.get("reference"))), None)
+        valid_totals = [Decimal(str(calc["line_total_eur"])) for _, calc in entries
+                        if calc["line_total_eur"] is not None]
+        calculated_sum = sum(valid_totals, Decimal("0"))
+        has_zero_avg = any(calc["avg_price_state"] == "ZERO" for _, calc in entries)
+        all_ok = all(calc["calculation_status"] == "OK" for _, calc in entries)
+        historical = historical_avg.get(task_card)
+        issues = sorted({calc["calculation_status"] for _, calc in entries
+                         if calc["calculation_status"] != "OK"})
+        if not task_card:
+            final, source = None, "MISSING_TASK_CARD"
+        elif has_zero_avg and historical is not None:
+            final = historical * (Decimal("1") + fallback_markup / Decimal("100"))
+            source = "HISTORICAL_AVG_PLUS_MARKUP"
+        elif all_ok:
+            final, source = calculated_sum, "CALCULATED_LINE_SUM"
+        else:
+            final, source = None, "REVIEW_REQUIRED"
+        if final is not None:
+            resolved_total += final
+        rows.append([
+            task_card or None, reference, len(entries), len(valid_totals), float(calculated_sum),
+            float(historical) if historical is not None else None, float(fallback_markup),
+            float(final) if final is not None else None, source, "; ".join(issues),
+        ])
+    rows.sort(key=lambda row: str(row[0] or ""))
+    rows.append(["SUM_AVG", None, None, None, None, None, None, float(resolved_total),
+                 "FINAL_TOTAL_EUR", None])
+    return rows, float(resolved_total)
+
+
 def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int, inputs=(),
-                 *, amos_index=None):
+                 *, amos_index=None, historical_avg=None, fallback_markup=Decimal("20"), aliases=None):
+    historical_avg = historical_avg or {}
+    aliases = aliases or {}
     if not all("rule_issues" in row and "measure_unit_ext" in row for row in uom_rows):
         annotate_uom_rows(uom_rows)
     stat_parts = {r["part_key"] for r in stat_rows if r["part_key"]}
@@ -225,22 +382,32 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
     if max(candidate_count, len(stat_rows), len(uom_rows)) > 1_048_575:
         raise ValueError("STAT, UOM or candidate rows exceed the Excel worksheet limit with a header.")
 
-    decisions, matches, review, only_stat, stat_missing = [], [], [], [], []
+    decisions, matches, review, only_stat, stat_missing, calculation_details = [], [], [], [], [], []
     for stat in stat_rows:
         part, source_row, unit = stat["part_key"], stat["row"], stat["unit"]
         uoms = by_part.get(part, [])
         candidates = [(r, match_side(unit, r)) for r in uoms]
         matched = [(r, side) for r, side in candidates if side != "NONE"]
         status = decide(stat, uoms, matched)
+        calculation = calculate_line(stat, uoms, amos_index, aliases)
+        if calculation["conversion_status"] == "SAME_UNIT_OR_ALIAS":
+            status = "UNIT_ALIAS_APPLIED" if calculation["effective_stat_unit"] != stat["unit_key"] else "SAME_AMOS_UNIT"
+        calculation_details.append((stat, calculation))
         decisions.append([source_row, stat["partno"], unit, len(uoms), len(matched),
-                          sum(not r["rule_issues"] for r, side in matched), status, False,
+                          sum(not r["rule_issues"] for r, side in matched), status,
+                          calculation["conversion_status"] in {"SAME_UNIT_OR_ALIAS", "UOM_RULE_APPLIED"},
                           stat.get("stat_quantity"), stat.get("task_card"), stat.get("reference"),
-                          *amos_evidence(amos_index, part)])
+                          *amos_evidence(amos_index, part),
+                          calculation["effective_stat_unit"], calculation["converted_quantity"],
+                          calculation["conversion_rate"], calculation["conversion_base"],
+                          calculation["conversion_status"], calculation["unit_price_eur"],
+                          calculation["price_source"], calculation["line_total_eur"],
+                          calculation["calculation_status"]])
         # Every row here is a possible lookup alternative linked to one STAT row.
         for r, side in candidates:
             matches.append([part, source_row, unit, r["row"], r["external"], r["internal"],
                             r["rate"], r["exchange_base"], status, side, "; ".join(r["rule_issues"]) or "OK"])
-        if not status.startswith("SINGLE_"):
+        if not status.startswith("SINGLE_") and status not in {"SAME_AMOS_UNIT", "UNIT_ALIAS_APPLIED"}:
             review.append([part, source_row, unit,
                            "; ".join(f"{r['external']}→{r['internal']}" for r in uoms), status])
         if not part:
@@ -273,8 +440,17 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
     stats = {"stat_rows": len(stat_rows), "uom_rows": len(uom_rows),
              "matched_partnos": len(stat_parts.intersection(by_part)),
              "candidate_pairs": len(matches), "review_rows": len(review), "uom_variants": len(variants)}
+    service_rows, sum_avg = build_service_summary(calculation_details, historical_avg, fallback_markup)
+    stats["sum_avg_eur"] = sum_avg
     wb = Workbook()
     wb.remove(wb.active)
+    service_sheet = append_sheet(wb, "Service Summary", ["task_card", "reference", "stat_rows",
+        "calculated_rows", "calculated_line_sum_eur", "historical_avg_eur",
+        "fallback_markup_percent", "final_service_eur", "final_price_source", "issues"], service_rows)
+    for column in (5, 6, 8):
+        for cells in service_sheet.iter_cols(min_col=column, max_col=column, min_row=2):
+            for cell in cells:
+                cell.number_format = '#,##0.00 "EUR"'
     summary = [
         ["STAT andmeread", len(decisions)], ["UOM andmeread", len(uom_rows)],
         ["STAT unikaalsed partno-d", len(stat_parts)], ["UOM unikaalsed partno-d", len(by_part)],
@@ -285,13 +461,18 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
         ["Vastuolulised UOM reeglid (read)", len(conflicts)],
         ["STAT partno puudub", len(stat_missing)], ["UOM partno puudub", len(uom_missing)],
         ["STAT partno veerg", get_column_letter(stat_col)], ["STAT mõõtühiku veerg", get_column_letter(unit_col)],
-        ["Algfaile muudeti", "EI"], ["Ühikute teisendusi arvutati", "EI"], ["Hinnaarvutusi tehti", "EI"],
+        ["SUM_AVG EUR", sum_avg], ["Algfaile muudeti", "EI"],
+        ["Ühikute teisendusi arvutati", "JAH, ainult kinnitatud reeglitega"],
+        ["Hinnaarvutusi tehti", "JAH, AMOS avg_price on EUR"],
     ]
     append_sheet(wb, "Kokkuvote", ["Näitaja", "Tulemus"], summary)
     append_sheet(wb, "STAT decisions", ["stat_row", "partno", "stat_unit", "part_rule_rows",
         "unit_match_rows", "clean_unit_match_rows", "unit_decision", "conversion_approved",
         "stat_quantity", "task_card", "reference", "amos_lookup_status", "amos_source_row", "amos_unit",
-        "avg_price", "avg_price_state", "purch_price", "purch_price_state"], decisions)
+        "avg_price", "avg_price_state", "purch_price", "purch_price_state",
+        "effective_stat_unit", "converted_quantity", "conversion_rate", "conversion_base",
+        "conversion_status", "unit_price_eur", "price_source", "line_total_eur",
+        "calculation_status"], decisions)
     append_sheet(wb, "Vastavused", ["partno", "STAT rida", "STAT ühik", "UOM rida", "UOM ext ühik",
         "UOM sisemine ühik", "rate", "exchange_base", "Olek", "match_side", "rule_issues"], matches)
     append_sheet(wb, "Unit ulevaatus", ["partno", "STAT rida", "STAT ühik", "UOM variandid", "Märkus"], review)
@@ -321,6 +502,10 @@ def main():
     parser.add_argument("--quantity-col", type=int, help="STAT quantity column (H=8)")
     parser.add_argument("--task-card-col", type=int, help="STAT Task Card column (C=3)")
     parser.add_argument("--reference-col", type=int, help="STAT Reference column (unset by default)")
+    parser.add_argument("--historical-sheet", default="AVG", help="Historical service average sheet")
+    parser.add_argument("--fallback-markup", type=Decimal, default=Decimal("20"),
+                        help="Markup percent when AMOS avg_price is zero")
+    parser.add_argument("--unit-alias", action="append", default=[], help="Unit alias, for example LT=L")
     parser.add_argument("--output", type=Path, default=OUTPUT_DEFAULT, help="Raporti Excel faili tee")
     parser.add_argument("--part-col", type=int, default=STAT_PARTNO_COL, help="STAT partno veerg (F=6)")
     parser.add_argument("--unit-col", type=int, default=STAT_UNIT_COL, help="STAT ühiku veerg (I=9)")
@@ -339,7 +524,11 @@ def main():
                           task_card_col=args.task_card_col, reference_col=args.reference_col)
     amos_index = read_amos_for_stat(args.amos, stat_rows) if args.amos is not None else None
     uom_rows = read_uom(uom_path)
-    stats = build_report(stat_rows, uom_rows, args.output, args.part_col, args.unit_col, inputs, amos_index=amos_index)
+    historical_avg = read_historical_avg(stat_path, args.historical_sheet)
+    aliases = parse_unit_aliases(args.unit_alias)
+    stats = build_report(stat_rows, uom_rows, args.output, args.part_col, args.unit_col, inputs,
+                         amos_index=amos_index, historical_avg=historical_avg,
+                         fallback_markup=args.fallback_markup, aliases=aliases)
     print(f"Raport salvestatud: {args.output}")
     for label, value in stats.items():
         print(f"{label}: {value}")

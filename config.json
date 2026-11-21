@@ -11,5 +11,14 @@
     "quantity": 8,
     "task_card": 3,
     "reference": 1
+  },
+  "business_rules": {
+    "currency": "EUR",
+    "price_field": "avg_price",
+    "historical_sheet": "AVG",
+    "fallback_markup_percent": 20,
+    "unit_aliases": {
+      "LT": "L"
+    }
   }
 }

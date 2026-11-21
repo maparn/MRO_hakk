@@ -99,8 +99,8 @@ class ReportIntegration(unittest.TestCase):
         decisions = records(self.output / SORT, "STAT decisions")
         self.assertEqual([r["stat_row"] for r in decisions], [2, 3, 4])
         self.assertEqual([r["unit_decision"] for r in decisions],
-                         ["INVALID_MATCHING_RULE", "AMBIGUOUS_UNIT_MATCH", "UNIT_NOT_LISTED"])
-        self.assertTrue(all(r["conversion_approved"] is False for r in decisions))
+                         ["SAME_AMOS_UNIT", "AMBIGUOUS_UNIT_MATCH", "UNIT_NOT_LISTED"])
+        self.assertEqual([r["conversion_approved"] for r in decisions], [True, False, False])
         self.assertEqual([r["stat_quantity"] for r in decisions], [1, 2, 3])
         self.assertEqual([r["task_card"] for r in decisions], ["TASK-A", "TASK-B", "TASK-C"])
         self.assertTrue(all(r["amos_lookup_status"] == "UNIQUE" for r in decisions))
@@ -190,3 +190,26 @@ class ReportIntegration(unittest.TestCase):
             self.assertTrue(all(c.data_type == "s" for c in row))
         finally:
             book.close()
+
+    def test_zero_avg_price_uses_historical_service_average_plus_twenty_percent(self):
+        book = load_workbook(self.amos)
+        book["Sheet1"]["D3"] = 0
+        book.save(self.amos)
+        book.close()
+
+        book = load_workbook(self.stat)
+        avg = book.create_sheet("AVG")
+        avg.append(["TaskCard", "avg"])
+        avg.append(["TASK-B", 100])
+        avg.append(["TASK-C", 200])
+        book.save(self.stat)
+        book.close()
+
+        self.cli("scripts/sorter.py", "--amos", self.amos, "--unit-alias", "LT=L",
+                 "--fallback-markup", "20")
+        services = records(self.output / SORT, "Service Summary")
+        by_task = {row["task_card"]: row for row in services}
+        self.assertEqual(by_task["TASK-B"]["final_service_eur"], 120)
+        self.assertEqual(by_task["TASK-C"]["final_service_eur"], 240)
+        self.assertEqual(by_task["SUM_AVG"]["final_service_eur"], 361.25)
+        self.assertEqual(by_task["TASK-B"]["final_price_source"], "HISTORICAL_AVG_PLUS_MARKUP")
