@@ -1,5 +1,25 @@
 # MRO_hakk
 
+## Windowsi nupp
+
+Topeltklõps `MRO_Test.bat` failil. Nupp kontrollib kolm sisendfaili, eemaldab vanad
+genereeritud raportid, käivitab automaattestid, loob ühe põhiraporti ja avab
+`excel_files/output` kausta. Iga käivitus asendab sama faili
+`STAT_UOM_vordlusraport.xlsx`; uusi nummerdatud koopiaid ei looda.
+
+Uue testi jaoks kopeeri uued sama nimega failid `excel_files/input` kausta. Windows
+küsib, kas olemasolevad failid asendada. Vali asendamine ja käivita `MRO_Test.bat`.
+
+Sisendkaustas peab olema täpselt kolm faili: `STAT_INITIAL - Copy.xlsx`,
+`AMOS_uus_süsteem_info.xlsx` ja `AMOS_UOM.xlsx`.
+
+`MRO_Puhasta.bat` eemaldab pärast kinnitust kõik `config.json` failis nimetatud input-
+ja output-Excelid. Kasuta seda ainult enne uute sisendfailide laadimist.
+
+Failinimed ja STAT-i veerunumbrid asuvad `config.json` failis. Hinna valiku,
+valuutakursi ja mõõtühikute ärireegleid pole sinna lisatud, sest need vajavad veel
+ettevõtte kinnitust.
+
 Подготовка справочника AMOS и сверка расходных строк STAT для Magnetic MRO. Основной результат для разработчика Excel — лист `STAT decisions`: одна запись на содержательную строку листа `INITIAL`, включая строки с проблемными ключами. Стоимость и разрешение на перевод единиц определяет расчётный процесс команды.
 
 ## Запуск в Ubuntu

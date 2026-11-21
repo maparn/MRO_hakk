@@ -1,0 +1,15 @@
+{
+  "input_files": {
+    "stat": "excel_files/input/STAT_INITIAL - Copy.xlsx",
+    "amos": "excel_files/input/AMOS_uus_süsteem_info.xlsx",
+    "uom": "excel_files/input/AMOS_UOM.xlsx"
+  },
+  "output_file": "excel_files/output/STAT_UOM_vordlusraport.xlsx",
+  "stat_columns": {
+    "part_number": 6,
+    "unit": 9,
+    "quantity": 8,
+    "task_card": 3,
+    "reference": 1
+  }
+}

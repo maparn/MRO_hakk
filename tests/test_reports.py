@@ -67,6 +67,8 @@ class ReportIntegration(unittest.TestCase):
             ("PAINT", "ML", "L", 1, 1000, "Millilitres"),
         ])
         workbook(self.stat, "INITIAL", [
+            ("Reference", None, "TaskCard", "NRCNum", "Factor", "PN", "Description",
+             "Qty", "Unit"),
             (None, None, "TASK-A", None, None, "-999-22G1", None, 1, "ME", "=1+2"),
             (None, None, "TASK-B", None, None, " paint ", None, 2, "L"),
             (None, None, "TASK-C", None, None, "PAINT", None, 3, "LT"),
@@ -95,7 +97,7 @@ class ReportIntegration(unittest.TestCase):
         self.assertEqual(records(self.output / PREP, "UOM_Map")[0]["description"], "Unusable rule")
 
         decisions = records(self.output / SORT, "STAT decisions")
-        self.assertEqual([r["stat_row"] for r in decisions], [1, 2, 3])
+        self.assertEqual([r["stat_row"] for r in decisions], [2, 3, 4])
         self.assertEqual([r["unit_decision"] for r in decisions],
                          ["INVALID_MATCHING_RULE", "AMBIGUOUS_UNIT_MATCH", "UNIT_NOT_LISTED"])
         self.assertTrue(all(r["conversion_approved"] is False for r in decisions))

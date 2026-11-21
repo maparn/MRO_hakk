@@ -35,6 +35,8 @@ UOM_SHEET = "Sheet1"
 STAT_PARTNO_COL = 6
 STAT_UNIT_COL = 9
 UOM_FIELDS = ("partno", "measure_unit_ext", "measure_unit", "rate", "exchange_base")
+STAT_PART_HEADERS = {"PN", "PARTNO", "PART NO", "PART NUMBER"}
+STAT_UNIT_HEADERS = {"UNIT", "MEASURE_UNIT", "MEASURE UNIT", "UOM"}
 
 
 def locate_input(filename: str) -> Path:
@@ -67,6 +69,8 @@ def read_stat(path: Path, part_col: int, unit_col: int, *, quantity_col: int | N
                 return cells[col - 1] if col is not None and col <= len(cells) else None
 
             partno, unit = cell(part_col), cell(unit_col)
+            if key(partno) in STAT_PART_HEADERS and key(unit) in STAT_UNIT_HEADERS:
+                continue
             rows.append({"row": row_no, "partno": partno, "part_key": key(partno),
                          "unit": unit, "unit_key": key(unit), "stat_quantity": cell(quantity_col or 8),
                          "task_card": cell(task_card_col or 3), "reference": cell(reference_col)})
