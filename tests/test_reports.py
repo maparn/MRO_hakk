@@ -229,7 +229,7 @@ class ReportIntegration(unittest.TestCase):
             details, {"NEW-HIGH": Decimal("100"), "OLD-HIGH": Decimal("100")},
             Decimal("20"), Decimal("500"), exchange_rate=Decimal("1.25"),
             exchange_date="2026-11-20", exchange_status="LIVE")
-        by_task = {row[0]: row for row in rows}
+        by_task = {row[1]: row for row in rows}
         self.assertEqual(by_task["NEW-HIGH"][7], 120)
         self.assertEqual(by_task["NEW-HIGH"][8], "NEW_PRICE_HIGHER_OR_EQUAL")
         self.assertEqual(by_task["OLD-HIGH"][7], 100)
@@ -245,6 +245,54 @@ class ReportIntegration(unittest.TestCase):
         self.assertEqual(rows[0][7], 1000)
         self.assertEqual(rows[0][10], "REVIEW_OVER_LIMIT")
         self.assertEqual(total, 1000)
+
+    def test_incomplete_service_keeps_higher_partial_new_price(self):
+        details = [
+            ({"task_card": "TASK", "reference": "REF"},
+             {"line_total_eur": 141000, "calculation_status": "OK",
+              "avg_price_state": "POSITIVE"}),
+            ({"task_card": "TASK", "reference": None},
+             {"line_total_eur": None, "calculation_status": "AVG_PRICE_ZERO_SERVICE_FALLBACK",
+              "avg_price_state": "ZERO"}),
+        ]
+        rows, total = build_service_summary(
+            details, {"TASK": Decimal("2500")}, Decimal("20"), Decimal("500"))
+        self.assertEqual(rows[0][7], 141000)
+        self.assertEqual(rows[0][8], "PARTIAL_NEW_PRICE_HIGHER")
+        self.assertEqual(rows[0][10], "REVIEW_OVER_LIMIT")
+        self.assertEqual(total, 141000)
+
+    def test_incomplete_service_uses_marked_up_old_price_when_it_is_higher(self):
+        details = [
+            ({"task_card": "TASK", "reference": "REF"},
+             {"line_total_eur": 100, "calculation_status": "OK",
+              "avg_price_state": "POSITIVE"}),
+            ({"task_card": "TASK", "reference": None},
+             {"line_total_eur": None, "calculation_status": "AMOS_NOT_FOUND",
+              "avg_price_state": None}),
+        ]
+        rows, total = build_service_summary(
+            details, {"TASK": Decimal("1000")}, Decimal("20"), Decimal("500"))
+        self.assertEqual(rows[0][7], 1200)
+        self.assertEqual(rows[0][8], "OLD_PRICE_PLUS_MARKUP_FALLBACK")
+        self.assertEqual(total, 1200)
+
+    def test_service_with_only_partial_new_price_keeps_it_and_exposes_issue(self):
+        details = [
+            ({"task_card": "TASK", "reference": "REF"},
+             {"line_total_eur": 700, "calculation_status": "OK",
+              "avg_price_state": "POSITIVE"}),
+            ({"task_card": "TASK", "reference": None},
+             {"line_total_eur": None, "calculation_status": "AMOS_NOT_FOUND",
+              "avg_price_state": None}),
+        ]
+        rows, total = build_service_summary(
+            details, {}, Decimal("20"), Decimal("1000"))
+        self.assertEqual(rows[0][7], 700)
+        self.assertEqual(rows[0][8], "PARTIAL_NEW_PRICE_ONLY")
+        self.assertEqual(rows[0][10], "WITHIN_LIMIT")
+        self.assertEqual(rows[0][15], "AMOS_NOT_FOUND")
+        self.assertEqual(total, 700)
 
     def test_ecb_xml_parser_reads_eur_usd_rate_and_date(self):
         payload = b'''<gesmes:Envelope xmlns:gesmes="x" xmlns="y"><Cube><Cube time="2026-11-20">

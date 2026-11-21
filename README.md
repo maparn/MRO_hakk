@@ -43,7 +43,9 @@ Praegune kinnitatud loogika kasutab EUR-is olevat AMOS `avg_price` väärtust,
 teisendab koguse UOM `rate / exchange_base` järgi ja käsitleb `LT` ühikut `L`
 aliasena. Kui uus hind ja ajalooline `AVG` on mõlemad olemas, jääb lõplikuks suurem
 hind. Kui uut hinda ei saa täielikult arvutada, kasutatakse sama Task Cardi vana
-`AVG` väärtust 20% lisaga. EUR/USD kurss laaditakse automaatselt Euroopa Keskpanga
+`AVG` väärtust 20% lisaga võrdlushinnana. Kui osaliselt arvutatud uus summa on
+sellest suurem, säilitatakse suurem uus summa ja raport näitab puuduva rea hoiatust.
+EUR/USD kurss laaditakse automaatselt Euroopa Keskpanga
 päevakursist; võrguvea korral kasutatakse viimast edukalt salvestatud ECB kurssi.
 `Service Summary` näitab lõpphinda nii EUR-is kui USD-s ning viimane rida `SUM_AVG`
 on lõplik summa üle kõigi teenuste.

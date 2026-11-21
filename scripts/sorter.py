@@ -342,6 +342,7 @@ def build_service_summary(details, historical_avg, fallback_markup, approval_lim
         historical = historical_avg.get(task_card)
         issues = sorted({calc["calculation_status"] for _, calc in entries
                          if calc["calculation_status"] != "OK"})
+        has_new_price = bool(valid_totals)
         if not task_card:
             final, source = None, "MISSING_TASK_CARD"
         elif all_ok and historical is not None:
@@ -351,9 +352,17 @@ def build_service_summary(details, historical_avg, fallback_markup, approval_lim
                 final, source = historical, "OLD_PRICE_HIGHER"
         elif all_ok:
             final, source = calculated_sum, "NEW_PRICE_ONLY"
+        elif historical is not None and has_new_price:
+            marked_up_old = historical * (Decimal("1") + fallback_markup / Decimal("100"))
+            if calculated_sum >= marked_up_old:
+                final, source = calculated_sum, "PARTIAL_NEW_PRICE_HIGHER"
+            else:
+                final, source = marked_up_old, "OLD_PRICE_PLUS_MARKUP_FALLBACK"
         elif historical is not None:
             final = historical * (Decimal("1") + fallback_markup / Decimal("100"))
             source = "OLD_PRICE_PLUS_MARKUP_FALLBACK"
+        elif has_new_price:
+            final, source = calculated_sum, "PARTIAL_NEW_PRICE_ONLY"
         else:
             final, source = None, "REVIEW_REQUIRED"
         final_usd = final * exchange_rate if final is not None and exchange_rate is not None else None
@@ -366,17 +375,18 @@ def build_service_summary(details, historical_avg, fallback_markup, approval_lim
         if final is not None:
             resolved_total += final
         rows.append([
-            task_card or None, reference, len(entries), len(valid_totals), float(calculated_sum),
-            float(historical) if historical is not None else None, float(fallback_markup),
+            reference, task_card or None, len(entries), len(valid_totals),
+            float(historical) if historical is not None else None, float(calculated_sum),
+            float(fallback_markup),
             float(final) if final is not None else None, source,
             float(approval_limit) if approval_limit is not None else None, approval_status,
             float(exchange_rate) if exchange_rate is not None else None, exchange_date,
             exchange_status, float(final_usd) if final_usd is not None else None,
             "; ".join(issues),
         ])
-    rows.sort(key=lambda row: str(row[0] or ""))
+    rows.sort(key=lambda row: str(row[1] or ""))
     resolved_usd = resolved_total * exchange_rate if exchange_rate is not None else None
-    rows.append(["SUM_AVG", None, None, None, None, None, None, float(resolved_total),
+    rows.append([None, "SUM_AVG", None, None, None, None, None, float(resolved_total),
                  "FINAL_TOTAL_EUR", float(approval_limit) if approval_limit is not None else None,
                  "TOTAL", float(exchange_rate) if exchange_rate is not None else None,
                  exchange_date, exchange_status,
@@ -476,8 +486,8 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
     stats["sum_avg_eur"] = sum_avg
     wb = Workbook()
     wb.remove(wb.active)
-    service_sheet = append_sheet(wb, "Service Summary", ["task_card", "reference", "stat_rows",
-        "calculated_rows", "calculated_line_sum_eur", "historical_avg_eur",
+    service_sheet = append_sheet(wb, "Service Summary", ["reference", "task_card", "stat_rows",
+        "calculated_rows", "historical_avg_eur", "calculated_line_sum_eur",
         "fallback_markup_percent", "final_service_eur", "final_price_source",
         "approval_limit_eur", "approval_status", "eur_usd_rate", "exchange_rate_date",
         "exchange_rate_status", "final_service_usd", "issues"], service_rows)

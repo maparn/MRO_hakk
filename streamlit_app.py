@@ -90,6 +90,8 @@ if result:
         "OLD_PRICE_HIGHER": "Vana hind on suurem",
         "NEW_PRICE_ONLY": "Ainult uus hind",
         "OLD_PRICE_PLUS_MARKUP_FALLBACK": "Vana hind + 20%",
+        "PARTIAL_NEW_PRICE_HIGHER": "Osaline uus hind on suurem",
+        "PARTIAL_NEW_PRICE_ONLY": "Ainult osaline uus hind",
         "REVIEW_REQUIRED": "Vajab hinnakontrolli",
     }
     approval_labels = {
@@ -111,10 +113,10 @@ if result:
     )
 
     table = [{
-        "Task Card": row["task_card"],
         "Reference": row["reference"],
-        "Uus hind EUR": row["calculated_line_sum_eur"],
+        "Task Card": row["task_card"],
         "Vana AVG EUR": row["historical_avg_eur"],
+        "Uus hind EUR": row["calculated_line_sum_eur"],
         "Lõpphind EUR": row["final_service_eur"],
         "Hinna valik": price_labels.get(row["final_price_source"], row["final_price_source"]),
         "Kinnitamine": approval_labels.get(row["approval_status"], row["approval_status"]),
