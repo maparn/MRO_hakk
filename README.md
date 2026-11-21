@@ -17,12 +17,18 @@ Sisendkaustas peab olema täpselt kolm faili: `STAT_INITIAL - Copy.xlsx`,
 ja output-Excelid. Kasuta seda ainult enne uute sisendfailide laadimist.
 
 Failinimed ja STAT-i veerunumbrid asuvad `config.json` failis. Hinna valiku,
-ajaloolise hinnalisa ning mõõtühikute aliased saab muuta `business_rules` plokis.
+ajaloolise hinnalisa, kinnitamise limiidi ning mõõtühikute aliased saab muuta
+`business_rules` plokis. `approval_limit_eur` võib olla 500, 1000 või muu positiivne
+summa. Limiit märgib rea kontrollimiseks, kuid ei vähenda arvutatud hinda.
+
 Praegune kinnitatud loogika kasutab EUR-is olevat AMOS `avg_price` väärtust,
 teisendab koguse UOM `rate / exchange_base` järgi ja käsitleb `LT` ühikut `L`
-aliasena. Kui `avg_price` on null, kasutatakse sama Task Cardi ajaloolist `AVG`
-väärtust 20% lisaga. `Service Summary` lehe viimane rida `SUM_AVG` on lõplik EUR
-summa üle kõigi teenuste.
+aliasena. Kui uus hind ja ajalooline `AVG` on mõlemad olemas, jääb lõplikuks suurem
+hind. Kui uut hinda ei saa täielikult arvutada, kasutatakse sama Task Cardi vana
+`AVG` väärtust 20% lisaga. EUR/USD kurss laaditakse automaatselt Euroopa Keskpanga
+päevakursist; võrguvea korral kasutatakse viimast edukalt salvestatud ECB kurssi.
+`Service Summary` näitab lõpphinda nii EUR-is kui USD-s ning viimane rida `SUM_AVG`
+on lõplik summa üle kõigi teenuste.
 
 Подготовка справочника AMOS и сверка расходных строк STAT для Magnetic MRO. Основной результат для разработчика Excel — лист `STAT decisions`: одна запись на содержательную строку листа `INITIAL`, включая строки с проблемными ключами. Стоимость и разрешение на перевод единиц определяет расчётный процесс команды.
 

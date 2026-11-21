@@ -17,8 +17,16 @@
     "price_field": "avg_price",
     "historical_sheet": "AVG",
     "fallback_markup_percent": 20,
+    "approval_limit_eur": 500,
     "unit_aliases": {
       "LT": "L"
     }
+  },
+  "exchange_rate": {
+    "provider": "ECB",
+    "url": "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml",
+    "target_currency": "USD",
+    "cache_file": "exchange_rate_cache.json",
+    "timeout_seconds": 10
   }
 }

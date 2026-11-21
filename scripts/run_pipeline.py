@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from exchange_rates import get_ecb_rate
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INPUT_DIR = (ROOT / "excel_files" / "input").resolve()
@@ -100,10 +102,16 @@ def main() -> int:
     python = sys.executable
     columns = config["stat_columns"]
     rules = config.get("business_rules", {})
+    exchange_config = config.get("exchange_rate", {})
     aliases = rules.get("unit_aliases", {})
     alias_arguments = [item for pair in aliases.items() for item in ("--unit-alias", f"{pair[0]}={pair[1]}")]
     if args.run_tests:
         run([python, "-B", "-m", "unittest", "discover", "-s", "tests", "-q"])
+    exchange = get_ecb_rate(
+        exchange_config["url"], (ROOT / exchange_config["cache_file"]).resolve(),
+        currency=exchange_config.get("target_currency", "USD"),
+        timeout=float(exchange_config.get("timeout_seconds", 10)),
+    )
     run([python, "-B", "scripts/sorter.py", "--stat", str(inputs["stat"]),
          "--uom", str(inputs["uom"]), "--amos", str(inputs["amos"]),
          "--part-col", str(columns["part_number"]), "--unit-col", str(columns["unit"]),
@@ -111,6 +119,9 @@ def main() -> int:
          "--reference-col", str(columns["reference"]),
          "--historical-sheet", str(rules.get("historical_sheet", "AVG")),
          "--fallback-markup", str(rules.get("fallback_markup_percent", 20)),
+         "--approval-limit", str(rules.get("approval_limit_eur", 500)),
+         "--eur-usd-rate", exchange["rate"], "--exchange-date", exchange["date"],
+         "--exchange-status", exchange["status"],
          *alias_arguments, "--output", str(output)])
 
     print(f"\nVALMIS. Uuendatud raport: {output}")

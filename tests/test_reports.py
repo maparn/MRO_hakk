@@ -6,12 +6,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
 from openpyxl import Workbook, load_workbook
 
 from scripts.report_io import literal_cell, save_report, validate_output
+from scripts.exchange_rates import parse_ecb_rate
+from scripts.sorter import build_service_summary
 from scripts.uom_rules import annotate_rules
 
 
@@ -212,4 +215,37 @@ class ReportIntegration(unittest.TestCase):
         self.assertEqual(by_task["TASK-B"]["final_service_eur"], 120)
         self.assertEqual(by_task["TASK-C"]["final_service_eur"], 240)
         self.assertEqual(by_task["SUM_AVG"]["final_service_eur"], 361.25)
-        self.assertEqual(by_task["TASK-B"]["final_price_source"], "HISTORICAL_AVG_PLUS_MARKUP")
+        self.assertEqual(by_task["TASK-B"]["final_price_source"], "OLD_PRICE_PLUS_MARKUP_FALLBACK")
+
+    def test_service_uses_higher_of_complete_new_and_old_price_without_markup(self):
+        details = [
+            ({"task_card": "NEW-HIGH", "reference": "A"},
+             {"line_total_eur": 120, "calculation_status": "OK", "avg_price_state": "POSITIVE"}),
+            ({"task_card": "OLD-HIGH", "reference": "B"},
+             {"line_total_eur": 80, "calculation_status": "OK", "avg_price_state": "POSITIVE"}),
+        ]
+        rows, total = build_service_summary(
+            details, {"NEW-HIGH": Decimal("100"), "OLD-HIGH": Decimal("100")},
+            Decimal("20"), Decimal("500"), exchange_rate=Decimal("1.25"),
+            exchange_date="2026-11-20", exchange_status="LIVE")
+        by_task = {row[0]: row for row in rows}
+        self.assertEqual(by_task["NEW-HIGH"][7], 120)
+        self.assertEqual(by_task["NEW-HIGH"][8], "NEW_PRICE_HIGHER_OR_EQUAL")
+        self.assertEqual(by_task["OLD-HIGH"][7], 100)
+        self.assertEqual(by_task["OLD-HIGH"][8], "OLD_PRICE_HIGHER")
+        self.assertEqual(by_task["NEW-HIGH"][14], 150)
+        self.assertEqual(total, 220)
+
+    def test_approval_limit_flags_but_does_not_cap_price(self):
+        details = [({"task_card": "TASK", "reference": None},
+                    {"line_total_eur": 1000, "calculation_status": "OK",
+                     "avg_price_state": "POSITIVE"})]
+        rows, total = build_service_summary(details, {}, Decimal("20"), Decimal("500"))
+        self.assertEqual(rows[0][7], 1000)
+        self.assertEqual(rows[0][10], "REVIEW_OVER_LIMIT")
+        self.assertEqual(total, 1000)
+
+    def test_ecb_xml_parser_reads_eur_usd_rate_and_date(self):
+        payload = b'''<gesmes:Envelope xmlns:gesmes="x" xmlns="y"><Cube><Cube time="2026-11-20">
+            <Cube currency="USD" rate="1.2345"/></Cube></Cube></gesmes:Envelope>'''
+        self.assertEqual(parse_ecb_rate(payload), (Decimal("1.2345"), "2026-11-20"))

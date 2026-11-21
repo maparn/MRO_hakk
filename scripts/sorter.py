@@ -10,6 +10,7 @@ No rule in this report authorizes a unit conversion or price calculation.
 from __future__ import annotations
 
 import argparse
+import warnings
 from collections import Counter, defaultdict
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +18,13 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+
+warnings.filterwarnings(
+    "ignore",
+    message="Workbook contains no default style, apply openpyxl's default",
+    category=UserWarning,
+    module="openpyxl.styles.stylesheet",
+)
 
 if __package__:
     from .amos_prepare import AMOS_FIELDS, open_records, parse_price
@@ -318,7 +326,8 @@ def calculate_line(stat, uoms, amos_index, aliases):
     return result
 
 
-def build_service_summary(details, historical_avg, fallback_markup):
+def build_service_summary(details, historical_avg, fallback_markup, approval_limit,
+                          exchange_rate=None, exchange_date=None, exchange_status="NOT_CONFIGURED"):
     services = defaultdict(list)
     for stat, calculation in details:
         services[key(stat.get("task_card"))].append((stat, calculation))
@@ -329,35 +338,56 @@ def build_service_summary(details, historical_avg, fallback_markup):
         valid_totals = [Decimal(str(calc["line_total_eur"])) for _, calc in entries
                         if calc["line_total_eur"] is not None]
         calculated_sum = sum(valid_totals, Decimal("0"))
-        has_zero_avg = any(calc["avg_price_state"] == "ZERO" for _, calc in entries)
         all_ok = all(calc["calculation_status"] == "OK" for _, calc in entries)
         historical = historical_avg.get(task_card)
         issues = sorted({calc["calculation_status"] for _, calc in entries
                          if calc["calculation_status"] != "OK"})
         if not task_card:
             final, source = None, "MISSING_TASK_CARD"
-        elif has_zero_avg and historical is not None:
-            final = historical * (Decimal("1") + fallback_markup / Decimal("100"))
-            source = "HISTORICAL_AVG_PLUS_MARKUP"
+        elif all_ok and historical is not None:
+            if calculated_sum >= historical:
+                final, source = calculated_sum, "NEW_PRICE_HIGHER_OR_EQUAL"
+            else:
+                final, source = historical, "OLD_PRICE_HIGHER"
         elif all_ok:
-            final, source = calculated_sum, "CALCULATED_LINE_SUM"
+            final, source = calculated_sum, "NEW_PRICE_ONLY"
+        elif historical is not None:
+            final = historical * (Decimal("1") + fallback_markup / Decimal("100"))
+            source = "OLD_PRICE_PLUS_MARKUP_FALLBACK"
         else:
             final, source = None, "REVIEW_REQUIRED"
+        final_usd = final * exchange_rate if final is not None and exchange_rate is not None else None
+        if final is None:
+            approval_status = "PRICE_REVIEW_REQUIRED"
+        elif approval_limit is not None and final > approval_limit:
+            approval_status = "REVIEW_OVER_LIMIT"
+        else:
+            approval_status = "WITHIN_LIMIT"
         if final is not None:
             resolved_total += final
         rows.append([
             task_card or None, reference, len(entries), len(valid_totals), float(calculated_sum),
             float(historical) if historical is not None else None, float(fallback_markup),
-            float(final) if final is not None else None, source, "; ".join(issues),
+            float(final) if final is not None else None, source,
+            float(approval_limit) if approval_limit is not None else None, approval_status,
+            float(exchange_rate) if exchange_rate is not None else None, exchange_date,
+            exchange_status, float(final_usd) if final_usd is not None else None,
+            "; ".join(issues),
         ])
     rows.sort(key=lambda row: str(row[0] or ""))
+    resolved_usd = resolved_total * exchange_rate if exchange_rate is not None else None
     rows.append(["SUM_AVG", None, None, None, None, None, None, float(resolved_total),
-                 "FINAL_TOTAL_EUR", None])
+                 "FINAL_TOTAL_EUR", float(approval_limit) if approval_limit is not None else None,
+                 "TOTAL", float(exchange_rate) if exchange_rate is not None else None,
+                 exchange_date, exchange_status,
+                 float(resolved_usd) if resolved_usd is not None else None, None])
     return rows, float(resolved_total)
 
 
 def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int, inputs=(),
-                 *, amos_index=None, historical_avg=None, fallback_markup=Decimal("20"), aliases=None):
+                 *, amos_index=None, historical_avg=None, fallback_markup=Decimal("20"), aliases=None,
+                 approval_limit=Decimal("500"), exchange_rate=None, exchange_date=None,
+                 exchange_status="NOT_CONFIGURED"):
     historical_avg = historical_avg or {}
     aliases = aliases or {}
     if not all("rule_issues" in row and "measure_unit_ext" in row for row in uom_rows):
@@ -440,17 +470,24 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
     stats = {"stat_rows": len(stat_rows), "uom_rows": len(uom_rows),
              "matched_partnos": len(stat_parts.intersection(by_part)),
              "candidate_pairs": len(matches), "review_rows": len(review), "uom_variants": len(variants)}
-    service_rows, sum_avg = build_service_summary(calculation_details, historical_avg, fallback_markup)
+    service_rows, sum_avg = build_service_summary(
+        calculation_details, historical_avg, fallback_markup, approval_limit,
+        exchange_rate, exchange_date, exchange_status)
     stats["sum_avg_eur"] = sum_avg
     wb = Workbook()
     wb.remove(wb.active)
     service_sheet = append_sheet(wb, "Service Summary", ["task_card", "reference", "stat_rows",
         "calculated_rows", "calculated_line_sum_eur", "historical_avg_eur",
-        "fallback_markup_percent", "final_service_eur", "final_price_source", "issues"], service_rows)
-    for column in (5, 6, 8):
+        "fallback_markup_percent", "final_service_eur", "final_price_source",
+        "approval_limit_eur", "approval_status", "eur_usd_rate", "exchange_rate_date",
+        "exchange_rate_status", "final_service_usd", "issues"], service_rows)
+    for column in (5, 6, 8, 10):
         for cells in service_sheet.iter_cols(min_col=column, max_col=column, min_row=2):
             for cell in cells:
                 cell.number_format = '#,##0.00 "EUR"'
+    for cells in service_sheet.iter_cols(min_col=15, max_col=15, min_row=2):
+        for cell in cells:
+            cell.number_format = '#,##0.00 "USD"'
     summary = [
         ["STAT andmeread", len(decisions)], ["UOM andmeread", len(uom_rows)],
         ["STAT unikaalsed partno-d", len(stat_parts)], ["UOM unikaalsed partno-d", len(by_part)],
@@ -461,7 +498,10 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
         ["Vastuolulised UOM reeglid (read)", len(conflicts)],
         ["STAT partno puudub", len(stat_missing)], ["UOM partno puudub", len(uom_missing)],
         ["STAT partno veerg", get_column_letter(stat_col)], ["STAT mõõtühiku veerg", get_column_letter(unit_col)],
-        ["SUM_AVG EUR", sum_avg], ["Algfaile muudeti", "EI"],
+        ["SUM_AVG EUR", sum_avg], ["Kinnitamise limiit EUR", float(approval_limit)],
+        ["EUR/USD kurss", float(exchange_rate) if exchange_rate is not None else "PUUDUB"],
+        ["Kursi kuupäev", exchange_date or "PUUDUB"], ["Kursi olek", exchange_status],
+        ["Algfaile muudeti", "EI"],
         ["Ühikute teisendusi arvutati", "JAH, ainult kinnitatud reeglitega"],
         ["Hinnaarvutusi tehti", "JAH, AMOS avg_price on EUR"],
     ]
@@ -505,6 +545,11 @@ def main():
     parser.add_argument("--historical-sheet", default="AVG", help="Historical service average sheet")
     parser.add_argument("--fallback-markup", type=Decimal, default=Decimal("20"),
                         help="Markup percent when AMOS avg_price is zero")
+    parser.add_argument("--approval-limit", type=Decimal, default=Decimal("500"),
+                        help="Review threshold in EUR; it never caps the price")
+    parser.add_argument("--eur-usd-rate", type=Decimal, help="Official EUR to USD rate")
+    parser.add_argument("--exchange-date", help="Exchange-rate date")
+    parser.add_argument("--exchange-status", default="NOT_CONFIGURED")
     parser.add_argument("--unit-alias", action="append", default=[], help="Unit alias, for example LT=L")
     parser.add_argument("--output", type=Path, default=OUTPUT_DEFAULT, help="Raporti Excel faili tee")
     parser.add_argument("--part-col", type=int, default=STAT_PARTNO_COL, help="STAT partno veerg (F=6)")
@@ -528,7 +573,9 @@ def main():
     aliases = parse_unit_aliases(args.unit_alias)
     stats = build_report(stat_rows, uom_rows, args.output, args.part_col, args.unit_col, inputs,
                          amos_index=amos_index, historical_avg=historical_avg,
-                         fallback_markup=args.fallback_markup, aliases=aliases)
+                         fallback_markup=args.fallback_markup, aliases=aliases,
+                         approval_limit=args.approval_limit, exchange_rate=args.eur_usd_rate,
+                         exchange_date=args.exchange_date, exchange_status=args.exchange_status)
     print(f"Raport salvestatud: {args.output}")
     for label, value in stats.items():
         print(f"{label}: {value}")

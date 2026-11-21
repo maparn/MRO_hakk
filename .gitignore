@@ -37,3 +37,6 @@ output/
 
 # Logs
 *.log
+
+# Automatically refreshed ECB exchange-rate cache
+exchange_rate_cache.json
