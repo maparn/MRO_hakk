@@ -22,7 +22,7 @@ FAILID:
 
 MÄRKUS:
 STAT-failis ei ole päiserida. Praeguse näidisrea põhjal on:
-    STAT veerg C = partno (nt ZL-500-02-1-60)
+    STAT veerg F = partno (nt S15/90)
     STAT veerg I = measure_unit (nt LT)
 
 Kui sinu tegelikus STAT-failis on partno mõnes teises veerus,
@@ -43,15 +43,15 @@ from openpyxl.utils import get_column_letter
 
 KAUST = Path(__file__).resolve().parent
 
-STAT_FAIL = KAUST / "STAT_INITIAL - Copy.xlsx"
-UOM_FAIL = KAUST / "AMOS_UOM_edit.xlsx"
-RAPORT_FAIL = KAUST / "STAT_UOM_vordlusraport.xlsx"
+STAT_FAIL = KAUST / "excel_files" / "input" / "STAT_INITIAL - Copy.xlsx"
+UOM_FAIL = KAUST / "AMOS_UOM.xlsx"
+RAPORT_FAIL = KAUST / "excel_files" / "output" / "STAT_UOM_vordlusraport_friend.xlsx"
 
 STAT_LEHT = "INITIAL"
 UOM_LEHT = "Sheet1"
 
 # STAT-failis pole päiseid, seega määrame veerud käsitsi.
-STAT_PARTNO_COL = 3       # C-veerg
+STAT_PARTNO_COL = 6       # F-veerg
 STAT_MEASURE_UNIT_COL = 9 # I-veerg
 
 # Measure Unit faili päised.
@@ -222,6 +222,8 @@ def loe_uom_fail(failitee):
         )
 
     tööleht = töövihik[UOM_LEHT]
+    # AMOS Excel võib deklareerida valed töölehe mõõtmed.
+    tööleht.reset_dimensions()
 
     partno_veerg = leia_veeru_number(
         tööleht,
@@ -483,6 +485,7 @@ def koosta_raport(stat_read, uom_read, tulemused, failitee):
     kokkuvõte.column_dimensions["A"].width = 43
     kokkuvõte.column_dimensions["B"].width = 55
 
+    failitee.parent.mkdir(parents=True, exist_ok=True)
     töövihik.save(failitee)
     töövihik.close()
 
@@ -552,4 +555,4 @@ if __name__ == "__main__":
         print("\nPROGRAMMI TÖÖS TEKKIS VIGA:")
         print(viga)
 
-    input("\nVajuta Enter, et sulgeda...")
+    # Terminalis ei nõua täiendavat klahvivajutust.
