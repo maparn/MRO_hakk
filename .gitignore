@@ -1,0 +1,39 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Environment variables and API keys
+.env
+.env.*
+!.env.example
+
+# VS Code personal settings
+.vscode/
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+
+# Linux
+*~
+.Trash-*/
+
+# Temporary Excel files
+~$*.xlsx
+~$*.xls
+
+# Generated results
+output/
+
+# Logs
+*.log
