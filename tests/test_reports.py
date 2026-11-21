@@ -14,7 +14,7 @@ from openpyxl import Workbook, load_workbook
 
 from scripts.report_io import literal_cell, save_report, validate_output
 from scripts.exchange_rates import parse_ecb_rate
-from scripts.sorter import build_service_summary
+from scripts.sorter import build_service_summary, calculate_line
 from scripts.web_processing import process_workbooks
 from scripts.uom_rules import annotate_rules
 
@@ -293,6 +293,59 @@ class ReportIntegration(unittest.TestCase):
         self.assertEqual(rows[0][10], "WITHIN_LIMIT")
         self.assertEqual(rows[0][15], "AMOS_NOT_FOUND")
         self.assertEqual(total, 700)
+
+    def test_uom_rate_and_exchange_base_are_applied_in_the_documented_direction(self):
+        stat = {
+            "part_key": "SEAL", "unit_key": "FT", "stat_quantity": 10,
+        }
+        rules = [{
+            "external": "FT", "internal": "CM", "rate": 305,
+            "exchange_base": 10, "rule_issues": (),
+        }]
+        amos = {"SEAL": [{"measure_unit": "CM", "avg_price": 2}]}
+        result = calculate_line(stat, rules, amos, {})
+        self.assertEqual(result["converted_quantity"], 305)
+        self.assertEqual(result["conversion_rate"], 305)
+        self.assertEqual(result["conversion_base"], 10)
+        self.assertEqual(result["line_total_eur"], 610)
+        self.assertEqual(result["calculation_status"], "OK")
+
+    def test_unit_alias_preserves_quantity_before_price_multiplication(self):
+        stat = {
+            "part_key": "PAINT", "unit_key": "LT", "stat_quantity": 0.1,
+        }
+        amos = {"PAINT": [{"measure_unit": "L", "avg_price": 106.09}]}
+        result = calculate_line(stat, [], amos, {"LT": "L"})
+        self.assertEqual(result["effective_stat_unit"], "L")
+        self.assertEqual(result["converted_quantity"], 0.1)
+        self.assertAlmostEqual(result["line_total_eur"], 10.609)
+        self.assertEqual(result["conversion_status"], "SAME_UNIT_OR_ALIAS")
+
+    def test_final_price_never_falls_below_an_available_price_candidate(self):
+        cases = [
+            # Complete new price: compare directly with old AVG.
+            (1000, "OK", Decimal("1500"), Decimal("1500")),
+            (2000, "OK", Decimal("1500"), Decimal("2000")),
+            # Incomplete new price: compare it with old AVG + 20%.
+            (1000, "AMOS_NOT_FOUND", Decimal("1500"), Decimal("1800")),
+            (2000, "AMOS_NOT_FOUND", Decimal("1500"), Decimal("2000")),
+        ]
+        for new_price, second_status, old_price, expected in cases:
+            with self.subTest(new_price=new_price, status=second_status, old_price=old_price):
+                details = [
+                    ({"task_card": "TASK", "reference": "REF"},
+                     {"line_total_eur": new_price, "calculation_status": "OK",
+                      "avg_price_state": "POSITIVE"}),
+                ]
+                if second_status != "OK":
+                    details.append((
+                        {"task_card": "TASK", "reference": None},
+                        {"line_total_eur": None, "calculation_status": second_status,
+                         "avg_price_state": None},
+                    ))
+                rows, _ = build_service_summary(
+                    details, {"TASK": old_price}, Decimal("20"), Decimal("5000"))
+                self.assertEqual(Decimal(str(rows[0][7])), expected)
 
     def test_ecb_xml_parser_reads_eur_usd_rate_and_date(self):
         payload = b'''<gesmes:Envelope xmlns:gesmes="x" xmlns="y"><Cube><Cube time="2026-11-20">
