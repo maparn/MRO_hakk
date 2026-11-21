@@ -15,10 +15,10 @@ PAIGALDAMINE:
     py -m pip install openpyxl
 
 KÄIVITAMINE:
-    py compare_stat_uom.py
+    python scripts/compare_stat_uom_full.py
 
 FAILID:
-    Pane see .py-fail ja mõlemad Exceli failid samasse kausta.
+    Pane mõlemad Exceli failid kausta excel_files/input.
 
 MÄRKUS:
 STAT-failis ei ole päiserida. Praeguse näidisrea põhjal on:
@@ -41,10 +41,10 @@ from openpyxl.utils import get_column_letter
 # 1. SEADISTUSED
 # ============================================================
 
-KAUST = Path(__file__).resolve().parent
+KAUST = Path(__file__).resolve().parents[1]
 
 STAT_FAIL = KAUST / "excel_files" / "input" / "STAT_INITIAL - Copy.xlsx"
-UOM_FAIL = KAUST / "AMOS_UOM.xlsx"
+UOM_FAIL = KAUST / "excel_files" / "input" / "AMOS_UOM.xlsx"
 RAPORT_FAIL = KAUST / "excel_files" / "output" / "STAT_UOM_vordlusraport_friend.xlsx"
 
 STAT_LEHT = "INITIAL"
