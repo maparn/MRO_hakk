@@ -17,15 +17,17 @@ NEVER edits source workbooks or the teammate's STAT workbook.
 No unit conversions, price selection, currency conversions or price formulas.
 
 Run from the MRO_hakk folder:
-    python amos_prepare.py
+    python scripts/amos_prepare.py
 Optional:
-    python amos_prepare.py --amos "path/to/new.xlsx" --uom "path/to/UOM.xlsx"
+    python scripts/amos_prepare.py --amos "path/to/new.xlsx" --uom "path/to/UOM.xlsx"
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -35,6 +37,14 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
+if __package__:
+    from .report_io import literal_cell, save_report, validate_output
+    from .uom_rules import annotate_rules, normalize_key as norm
+else:
+    from report_io import literal_cell, save_report, validate_output
+    from uom_rules import annotate_rules, normalize_key as norm
+
+
 ROOT = Path(__file__).resolve().parent.parent
 AMOS_NAME = "AMOS_uus_süsteem_info.xlsx"
 UOM_NAME = "AMOS_UOM.xlsx"
@@ -42,22 +52,12 @@ DEFAULT_OUTPUT = ROOT / "excel_files" / "output" / "amos_prepared.xlsx"
 
 AMOS_FIELDS = ("partno", "description", "measure_unit", "avg_price", "sales", "purch_price")
 UOM_FIELDS = ("partno", "measure_unit_ext", "measure_unit", "rate", "exchange_base")
-
-
-def norm(value: object) -> str:
-    """Normalize lookup keys, but KEEP digits, zeros, dashes and slashes."""
-    return "" if value is None else str(value).strip().upper()
+UOM_CONTEXT = ("description", "mutation", "mutator", "status", "mutation_time",
+               "created_by", "created_date")
 
 
 def visible(value: object) -> str:
     return "" if value is None else str(value).strip()
-
-
-def safe_excel(value: object) -> object:
-    """Keep imported text literal, even when it begins with an Excel formula character."""
-    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
-        return "'" + value
-    return value
 
 
 def locate(filename: str) -> Path:
@@ -68,16 +68,16 @@ def locate(filename: str) -> Path:
     raise FileNotFoundError(f"Missing {filename}. Put it in MRO_hakk/ or excel_files/input/.")
 
 
-def read_records(path: Path, required: tuple[str, ...]) -> list[dict]:
-    """Read AMOS export using headers. reset_dimensions handles broken XLSX dimensions."""
+@contextmanager
+def open_records(path: Path, required: tuple[str, ...], optional: tuple[str, ...] = ()):
+    """Provide repeatable row iteration on the same open workbook snapshot."""
     book = load_workbook(path, read_only=True, data_only=True)
     try:
         if "Sheet1" not in book.sheetnames:
             raise ValueError(f"Expected Sheet1 in {path.name}. Found {book.sheetnames}")
         sheet = book["Sheet1"]
         sheet.reset_dimensions()  # Some AMOS exports declare an incorrect used range.
-        iterator = sheet.iter_rows(values_only=True)
-        header = next(iterator, None)
+        header = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
         if header is None:
             raise ValueError(f"Empty file: {path.name}")
         names = [norm(h).lower() for h in header]
@@ -86,19 +86,30 @@ def read_records(path: Path, required: tuple[str, ...]) -> list[dict]:
             raise ValueError(f"{path.name}: missing columns: {', '.join(missing)}")
         if len(set(names)) != len(names):
             raise ValueError(f"{path.name}: duplicate column headers")
-        indexes = {field: names.index(field) for field in required}
+        indexes = {field: names.index(field) for field in (*required, *optional) if field in names}
 
-        records = []
-        for excel_row, values in enumerate(iterator, start=2):
-            if not any(v is not None and visible(v) for v in values):
-                continue
-            record = {field: values[i] if i < len(values) else None
-                      for field, i in indexes.items()}
-            record["_excel_row"] = excel_row
-            records.append(record)
-        return records
+        def rows():
+            have_data = False
+            for excel_row, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
+                if not any(v is not None and visible(v) for v in values):
+                    continue
+                have_data = True
+                record = {field: values[i] if i < len(values) else None
+                          for field, i in indexes.items()}
+                record["_excel_row"] = excel_row
+                yield record
+            if not have_data:
+                raise ValueError(f"{path.name}: Sheet1 has column headers but no data rows")
+
+        yield rows
     finally:
         book.close()
+
+
+def read_records(path: Path, required: tuple[str, ...],
+                 optional: tuple[str, ...] = ()) -> list[dict]:
+    with open_records(path, required, optional) as rows:
+        return list(rows())
 
 
 def parse_price(value: object) -> tuple[float | None, str]:
@@ -114,20 +125,38 @@ def parse_price(value: object) -> tuple[float | None, str]:
         return None, "INVALID"
     if amount < 0:
         return None, "NEGATIVE"
-    return float(amount), "POSITIVE" if amount > 0 else "ZERO"
+    number = float(amount)
+    if not math.isfinite(number) or (amount != 0 and number == 0):
+        return None, "INVALID"
+    return number, "POSITIVE" if amount > 0 else "ZERO"
 
 
-def unit_rule_status(records: list[dict], source_unit: str) -> str:
-    """Informational matching ONLY; not permission to apply any conversion."""
+def assess_units(part: str, records: list[dict], source_unit: str):
+    """Summarize rule candidates; their direction and commercial use require confirmation."""
     if not source_unit:
-        return "SOURCE_UNIT_MISSING"
+        return "SOURCE_UNIT_MISSING", 0, 0, "MISSING_SOURCE_UNIT"
     if not records:
-        return "NO_UOM_RULE"  # Normal for most AMOS parts; not automatically an error.
-    if any(norm(r["measure_unit"]) == source_unit for r in records):
-        return "MATCHES_INTERNAL_UNIT"
-    if any(norm(r["measure_unit_ext"]) == source_unit for r in records):
-        return "MATCHES_EXTERNAL_UNIT"
-    return "UNIT_NOT_LISTED_IN_UOM"
+        reason = "NO_UOM_RULE" if part else "MISSING_PARTNO"
+        return "NO_UOM_RULE", 0, 0, reason
+
+    internal = [r for r in records if norm(r["measure_unit"]) == source_unit]
+    external = [r for r in records if norm(r["measure_unit_ext"]) == source_unit]
+    if not internal and not external:
+        return "UNIT_NOT_LISTED_IN_UOM", 0, 0, "UNIT_NOT_LISTED_IN_UOM"
+
+    matched_rows = {r["_excel_row"]: r for r in (*internal, *external)}
+    valid = sum(not r["rule_issues"] for r in matched_rows.values())
+    if valid < len(matched_rows):
+        decision = "REVIEW_INVALID_RULE"
+    elif valid > 1:
+        decision = "REVIEW_MULTIPLE_RULES"
+    else:
+        decision = "REVIEW_DIRECTION_AND_POLICY"
+    if internal and external:
+        status = "MATCHES_BOTH_SIDES"
+    else:
+        status = "MATCHES_INTERNAL_UNIT" if internal else "MATCHES_EXTERNAL_UNIT"
+    return status, len(matched_rows), valid, decision
 
 
 def make_sheet(book: Workbook, name: str, headers: list[str], widths: list[int]):
@@ -148,46 +177,47 @@ def make_sheet(book: Workbook, name: str, headers: list[str], widths: list[int])
 
 
 def append(sheet, values) -> None:
-    sheet.append([safe_excel(v) for v in values])
+    sheet.append([literal_cell(sheet, v) for v in values])
 
 
 def generate(amos_path: Path, uom_path: Path, output: Path) -> None:
-    if output.resolve() in {amos_path.resolve(), uom_path.resolve()}:
-        raise ValueError("Output path cannot be the same as an input workbook!")
+    inputs = (amos_path, uom_path)
+    validate_output(output, ROOT, inputs, owner=DEFAULT_OUTPUT.name)
+
+    print(f"Loading UOM:  {uom_path.name}")
+    uom = read_records(uom_path, UOM_FIELDS, UOM_CONTEXT)
+    annotate_rules(uom)
 
     print(f"Loading AMOS: {amos_path.name}")
-    amos = read_records(amos_path, AMOS_FIELDS)
-    print(f"Loading UOM:  {uom_path.name}")
-    uom = read_records(uom_path, UOM_FIELDS)
+    with open_records(amos_path, AMOS_FIELDS) as rows:
+        # Count keys first, then stream all source records into the write-only report.
+        part_counts = Counter(filter(None, (norm(r["partno"]) for r in rows())))
+        write_prepared_report(rows(), part_counts, uom, amos_path, uom_path, output)
 
-    # Keep all source rows. A repeated partno is flagged, never silently dropped.
-    part_counts = Counter(norm(r["partno"]) for r in amos if norm(r["partno"]))
+
+def write_prepared_report(amos, part_counts, uom, amos_path, uom_path, output):
     uom_by_part = defaultdict(list)
-    # Same external unit may map to multiple incompatible internal units/rates.
-    uom_by_external = defaultdict(set)
-    uom_rule_counts = Counter()
     for r in uom:
         part = norm(r["partno"])
-        ext = norm(r["measure_unit_ext"])
-        internal = norm(r["measure_unit"])
         if part:
             uom_by_part[part].append(r)
-            uom_rule_counts[(part, ext, internal, visible(r["rate"]), visible(r["exchange_base"]))] += 1
-            uom_by_external[(part, ext)].add((internal, visible(r["rate"]), visible(r["exchange_base"])))
 
     book = Workbook(write_only=True)
     prepared_headers = [
         "source_row", "partno", "description", "measure_unit", "avg_price",
         "purch_price", "sales", "avg_price_state", "purch_price_state",
         "price_status", "uom_rule_count", "uom_status", "issues",
-        "avg_price_raw", "purch_price_raw",
+        "avg_price_raw", "purch_price_raw", "partno_raw", "measure_unit_raw",
+        "uom_candidate_count", "uom_valid_candidate_count", "uom_conversion_status",
     ]
     prepared = make_sheet(book, "Prepared", prepared_headers,
-                          [12, 23, 45, 16, 17, 17, 14, 20, 20, 21, 18, 31, 48, 18, 18])
+                          [12, 23, 45, 16, 17, 17, 14, 20, 20, 21, 18, 31, 48, 18, 18, 23, 18, 23, 27, 36])
     uom_sheet = make_sheet(book, "UOM_Map", [
         "source_row", "partno", "measure_unit_ext", "measure_unit", "rate",
         "exchange_base", "exact_rule_repetitions", "uom_status",
-    ], [12, 23, 23, 20, 15, 18, 25, 33])
+        "rate_raw", "exchange_base_raw", "partno_raw", "measure_unit_ext_raw",
+        "measure_unit_raw", *UOM_CONTEXT,
+    ], [12, 23, 23, 20, 15, 18, 25, 33, 15, 20, 23, 24, 20, 45, 20, 20, 14, 20, 20, 20])
     issue_sheet = make_sheet(book, "Issues", [
         "source", "source_row", "partno", "measure_unit", "issues",
     ], [14, 14, 23, 20, 65])
@@ -212,11 +242,13 @@ def generate(amos_path: Path, uom_path: Path, output: Path) -> None:
             price_status = "NO_USABLE_PRICE"
 
         uom_entries = uom_by_part.get(part, [])
-        unit_status = unit_rule_status(uom_entries, unit)
+        unit_status, candidates, valid_candidates, conversion = assess_units(part, uom_entries, unit)
         errors = []
         if not part:
             errors.append("MISSING_PARTNO")
-        elif part_counts[part] > 1:
+        elif part == "-":
+            errors.append("CHECK_PLACEHOLDER_PARTNO")
+        if part and part_counts[part] > 1:
             errors.append("REPEATED_AMOS_PARTNO")
         if not unit:
             errors.append("MISSING_UNIT")
@@ -228,6 +260,8 @@ def generate(amos_path: Path, uom_path: Path, output: Path) -> None:
             errors.append("NO_USABLE_PRICE")
         if unit_status == "UNIT_NOT_LISTED_IN_UOM":
             errors.append("CHECK_UNIT_AGAINST_UOM")
+        if conversion in ("REVIEW_INVALID_RULE", "REVIEW_MULTIPLE_RULES"):
+            errors.append(conversion)
 
         metrics[f"PRICE_{price_status}"] += 1
         metrics[f"UOM_{unit_status}"] += 1
@@ -236,10 +270,11 @@ def generate(amos_path: Path, uom_path: Path, output: Path) -> None:
             append(issue_sheet, ["AMOS", r["_excel_row"], part, unit, "; ".join(errors)])
 
         append(prepared, [
-            r["_excel_row"], part, visible(r["description"]), unit, avg, purch,
+            r["_excel_row"], part, r["description"], unit, avg, purch,
             r["sales"], avg_state, purch_state, price_status,
             len(uom_entries), unit_status, "; ".join(errors),
-            r["avg_price"], r["purch_price"],
+            r["avg_price"], r["purch_price"], r["partno"], r["measure_unit"],
+            candidates, valid_candidates, conversion,
         ])
 
     for r in uom:
@@ -247,25 +282,19 @@ def generate(amos_path: Path, uom_path: Path, output: Path) -> None:
         part = norm(r["partno"])
         ext = norm(r["measure_unit_ext"])
         internal = norm(r["measure_unit"])
-        rate, rate_state = parse_price(r["rate"])
-        base, base_state = parse_price(r["exchange_base"])
-        key = (part, ext, internal, visible(r["rate"]), visible(r["exchange_base"]))
-        repeat = uom_rule_counts[key]
-        problems = []
-        if not part or not ext or not internal:
-            problems.append("MISSING_UOM_KEY")
-        if rate is None or rate <= 0 or base is None or base <= 0:
-            problems.append("INVALID_UOM_FACTOR")
-        if repeat > 1:
-            problems.append("REPEATED_UOM_RULE")
-        if len(uom_by_external[(part, ext)]) > 1:
-            problems.append("CONFLICTING_UOM_RULES")
+        rate, _ = parse_price(r["rate"])
+        base, _ = parse_price(r["exchange_base"])
+        repeat = r["exact_rule_repetitions"]
+        problems = r["rule_issues"]
         if problems:
             metrics["UOM_ROWS_WITH_ISSUES"] += 1
             append(issue_sheet, ["UOM", r["_excel_row"], part, ext,
                                  "; ".join(problems)])
         append(uom_sheet, [r["_excel_row"], part, ext, internal,
-                           rate, base, repeat, "; ".join(problems) or "OK"])
+                           rate, base, repeat, "; ".join(problems) or "OK",
+                           r["rate"], r["exchange_base"], r["partno"],
+                           r["measure_unit_ext"], r["measure_unit"],
+                           *(r.get(field) for field in UOM_CONTEXT)])
 
     for label, value in [
         ("Source AMOS file", amos_path.name),
@@ -291,16 +320,9 @@ def generate(amos_path: Path, uom_path: Path, output: Path) -> None:
     ]:
         append(summary_sheet, [label, value])
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(output.stem + ".incomplete.xlsx")
-    try:
-        book.save(temporary)
-        temporary.replace(output)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    save_report(book, output, ROOT, (amos_path, uom_path), owner=DEFAULT_OUTPUT.name)
     print(f"DONE: {output}")
-    print(f"AMOS rows: {len(amos):,}; UOM rules: {len(uom):,}")
+    print(f"AMOS rows: {metrics['AMOS_DATA_ROWS']:,}; UOM rules: {len(uom):,}")
     print(f"Rows missing both usable prices: {metrics['PRICE_NO_USABLE_PRICE']:,}")
     print("Original Excel/STAT and colleague's formulas were NOT changed.")
 
