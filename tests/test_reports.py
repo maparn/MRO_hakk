@@ -15,6 +15,7 @@ from openpyxl import Workbook, load_workbook
 from scripts.report_io import literal_cell, save_report, validate_output
 from scripts.exchange_rates import parse_ecb_rate
 from scripts.sorter import build_service_summary
+from scripts.web_processing import process_workbooks
 from scripts.uom_rules import annotate_rules
 
 
@@ -249,3 +250,31 @@ class ReportIntegration(unittest.TestCase):
         payload = b'''<gesmes:Envelope xmlns:gesmes="x" xmlns="y"><Cube><Cube time="2026-11-20">
             <Cube currency="USD" rate="1.2345"/></Cube></Cube></gesmes:Envelope>'''
         self.assertEqual(parse_ecb_rate(payload), (Decimal("1.2345"), "2026-11-20"))
+
+    def test_web_workflow_returns_downloadable_report_without_persisting_uploads(self):
+        config = {
+            "input_files": {
+                "stat": "excel_files/input/STAT_INITIAL - Copy.xlsx",
+                "amos": "excel_files/input/AMOS_uus_süsteem_info.xlsx",
+                "uom": "excel_files/input/AMOS_UOM.xlsx",
+            },
+            "output_file": "excel_files/output/STAT_UOM_vordlusraport.xlsx",
+            "stat_columns": {
+                "part_number": 6, "unit": 9, "quantity": 8,
+                "task_card": 3, "reference": 1,
+            },
+            "business_rules": {
+                "historical_sheet": "AVG", "fallback_markup_percent": 20,
+                "approval_limit_eur": 1000, "unit_aliases": {"LT": "L"},
+            },
+        }
+        result = process_workbooks(
+            {"stat": self.stat.read_bytes(), "amos": self.amos.read_bytes(),
+             "uom": self.uom.read_bytes()},
+            config,
+            {"rate": "1.25", "date": "2026-11-20", "status": "TEST"},
+        )
+        self.assertEqual(result["filename"], SORT)
+        self.assertTrue(result["report"].startswith(b"PK"))
+        self.assertEqual(result["summary"][-1]["task_card"], "SUM_AVG")
+        self.assertEqual(result["summary"][-1]["exchange_rate_status"], "TEST")

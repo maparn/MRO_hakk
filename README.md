@@ -1,5 +1,23 @@
 # MRO_hakk
 
+## Veebirakendus
+
+Brauseriversioon käivitub failist `streamlit_app.py`. Kasutaja laadib veebilehel
+kolm Exceli faili, vajutab arvutamise nuppu, kontrollib teenuste kokkuvõtet ning
+laadib alla ühe faili `STAT_UOM_vordlusraport.xlsx`. Üleslaaditud failid töödeldakse
+eraldi ajutises kaustas ja kustutatakse kohe pärast raporti loomist.
+
+Kohalik testkäivitus:
+
+```bash
+python -m pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+Avaldamiseks ühenda GitHubi repositoorium Streamlit Community Cloudiga, vali haru
+`main` ja rakenduse failiks `streamlit_app.py`. Eraldi domeeni ei ole vaja;
+Streamlit annab rakendusele püsiva `streamlit.app` aadressi.
+
 ## Windowsi nupp
 
 Topeltklõps `MRO_Test.bat` failil. Nupp kontrollib kolm sisendfaili, eemaldab vanad

@@ -387,7 +387,7 @@ def build_service_summary(details, historical_avg, fallback_markup, approval_lim
 def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int, inputs=(),
                  *, amos_index=None, historical_avg=None, fallback_markup=Decimal("20"), aliases=None,
                  approval_limit=Decimal("500"), exchange_rate=None, exchange_date=None,
-                 exchange_status="NOT_CONFIGURED"):
+                 exchange_status="NOT_CONFIGURED", project_root=PROJECT):
     historical_avg = historical_avg or {}
     aliases = aliases or {}
     if not all("rule_issues" in row and "measure_unit_ext" in row for row in uom_rows):
@@ -528,7 +528,7 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
     append_sheet(wb, "STAT puuduv partno", ["STAT rida", "STAT ühik"], stat_missing)
     append_sheet(wb, "UOM puuduv partno", ["UOM rida", "UOM ext", "UOM sisemine"], uom_missing)
     try:
-        save_report(wb, output, PROJECT, inputs, owner=OUTPUT_DEFAULT.name)
+        save_report(wb, output, project_root, inputs, owner=OUTPUT_DEFAULT.name)
     finally:
         wb.close()
     return stats

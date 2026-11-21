@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
@@ -30,9 +31,17 @@ def parse_ecb_rate(payload: bytes, currency: str = "USD") -> tuple[Decimal, str]
 
 def _write_cache(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    with NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent,
+        prefix=".mro-rate-", suffix=".tmp", delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        json.dump(record, handle, indent=2)
+        handle.write("\n")
+    try:
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def get_ecb_rate(url: str, cache_path: Path, *, currency: str = "USD",

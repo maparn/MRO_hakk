@@ -40,3 +40,6 @@ output/
 
 # Automatically refreshed ECB exchange-rate cache
 exchange_rate_cache.json
+
+# Streamlit local settings and uploaded-session state
+.streamlit/secrets.toml
