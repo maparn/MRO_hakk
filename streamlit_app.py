@@ -138,27 +138,3 @@ if result:
 st.markdown(
     '<p class="privacy">Failid töödeldakse eraldatud ajutises kaustas ja neid ei '
     'salvestata püsivalt serverisse.</p>', unsafe_allow_html=True)
-
-
-st.divider()
-st.subheader("Mõõtühikute teisendamine")
-
-converter_html = (
-    ROOT / "web" / "unit_converter.html"
-).read_text(encoding="utf-8")
-
-converter_js = (
-    ROOT / "web" / "unit_converter.js"
-).read_text(encoding="utf-8")
-
-converter_html = converter_html.replace(
-    '<script src="unit_converter.js"></script>',
-    f"<script>{converter_js}</script>"
-)
-
-with st.expander("Ava ühikute konverter"):
-    components.html(
-        converter_html,
-        height=690,
-        scrolling=True
-    )
