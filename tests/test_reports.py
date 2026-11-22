@@ -304,9 +304,45 @@ class ReportIntegration(unittest.TestCase):
         refs, tasks, sum_avg, status = build_aggregations(details, {}, Decimal("1.2"))
         self.assertEqual([row[7] for row in refs], [150, 250])
         self.assertEqual(tasks[0][5], 200)
-        self.assertEqual(tasks[0][8], 240)
+        self.assertEqual(tasks[0][7], 200)
+        self.assertEqual(tasks[0][8], "NEW")
+        self.assertEqual(tasks[0][10], 240)
         self.assertEqual(sum_avg, 200)
         self.assertEqual(status, "COMPLETE")
+
+    def test_higher_old_or_new_task_card_avg_is_selected(self):
+        details = [
+            (self.stat_line(reference="REF-A", task_card="TASK-NEW"),
+             {"line_total_eur": 650, "price_source": "AMOS_AVG_PRICE"}),
+            (self.stat_line(reference="REF-B", task_card="TASK-OLD"),
+             {"line_total_eur": 600, "price_source": "AMOS_AVG_PRICE"}),
+            (self.stat_line(reference="REF-C", task_card="TASK-EQUAL"),
+             {"line_total_eur": 300, "price_source": "AMOS_AVG_PRICE"}),
+        ]
+        old = {"TASK-NEW": Decimal("500"), "TASK-OLD": Decimal("800"),
+               "TASK-EQUAL": Decimal("300")}
+        _, tasks, final_total, status = build_aggregations(details, old, Decimal("1.1"))
+        by_task = {row[0]: row for row in tasks[:-1]}
+        self.assertEqual((by_task["TASK-NEW"][7], by_task["TASK-NEW"][8]), (650, "NEW"))
+        self.assertEqual((by_task["TASK-OLD"][7], by_task["TASK-OLD"][8]), (800, "OLD"))
+        self.assertEqual((by_task["TASK-EQUAL"][7], by_task["TASK-EQUAL"][8]), (300, "NEW"))
+        self.assertEqual(by_task["TASK-OLD"][10], 880)
+        self.assertEqual(final_total, 1750)
+        self.assertEqual(status, "COMPLETE")
+
+    def test_distinct_task_cards_never_mix_reference_totals(self):
+        details = [
+            (self.stat_line(reference="REF-A", task_card="TASK-1"),
+             {"line_total_eur": 100, "price_source": "AMOS_AVG_PRICE"}),
+            (self.stat_line(reference="REF-B", task_card="TASK-1"),
+             {"line_total_eur": 300, "price_source": "AMOS_AVG_PRICE"}),
+            (self.stat_line(reference="REF-A", task_card="TASK-2"),
+             {"line_total_eur": 900, "price_source": "AMOS_AVG_PRICE"}),
+        ]
+        _, tasks, _, _ = build_aggregations(details, {}, None)
+        by_task = {row[0]: row for row in tasks[:-1]}
+        self.assertEqual(by_task["TASK-1"][5], 200)
+        self.assertEqual(by_task["TASK-2"][5], 900)
 
     def test_unresolved_reference_is_not_presented_as_valid_zero(self):
         details = [
@@ -319,11 +355,26 @@ class ReportIntegration(unittest.TestCase):
         self.assertEqual(sum_avg, 0)
         self.assertEqual(status, "INCOMPLETE")
 
+    def test_incomplete_new_avg_still_selects_max_but_remains_flagged(self):
+        details = [
+            (self.stat_line(reference="REF-A", task_card="TASK"),
+             {"line_total_eur": 900, "price_source": "AMOS_AVG_PRICE"}),
+            (self.stat_line(reference="REF-B", task_card="TASK"),
+             {"line_total_eur": None, "price_source": "MANUAL_REVIEW_REQUIRED"}),
+        ]
+        _, tasks, final_total, status = build_aggregations(
+            details, {"TASK": Decimal("500")}, Decimal("1.2"))
+        self.assertEqual(tasks[0][5], 900)
+        self.assertEqual((tasks[0][7], tasks[0][8]), (900, "NEW"))
+        self.assertEqual(tasks[0][11], "INCOMPLETE")
+        self.assertEqual(final_total, 900)
+        self.assertEqual(status, "INCOMPLETE")
+
     def test_missing_exchange_rate_keeps_eur_and_leaves_usd_blank(self):
         details = [(self.stat_line(), {"line_total_eur": 100, "price_source": "AMOS_AVG_PRICE"})]
         _, tasks, sum_avg, status = build_aggregations(details, {}, None)
         self.assertEqual(sum_avg, 100)
-        self.assertIsNone(tasks[0][8])
+        self.assertIsNone(tasks[0][10])
         self.assertEqual(status, "COMPLETE")
 
     def test_uom_rate_and_exchange_base_are_applied_in_the_documented_direction(self):
@@ -384,5 +435,6 @@ class ReportIntegration(unittest.TestCase):
         self.assertEqual(result["filename"], SORT)
         self.assertTrue(result["report"].startswith(b"PK"))
         self.assertEqual(result["summary"][-1]["task_card"], "SUM_AVG")
+        self.assertEqual(result["summary"][-1]["final_task_card_price_eur"], 34.85)
         self.assertEqual(result["exchange"]["status"], "TEST")
         self.assertEqual(len(result["material_calculations"]), 3)

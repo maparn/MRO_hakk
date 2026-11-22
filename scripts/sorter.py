@@ -384,7 +384,7 @@ def calculate_line(stat, uoms, amos_index, aliases, fallback_markup=Decimal("20"
 
 
 def build_aggregations(details, historical_avg, exchange_rate=None):
-    """Aggregate material calculations by Reference, then average References by Task Card."""
+    """Aggregate rows by Reference, average by Task Card, then select max(old, new)."""
     grouped = defaultdict(list)
     for stat, calculation in details:
         grouped[(key(stat.get("reference")), key(stat.get("task_card")))].append((stat, calculation))
@@ -419,7 +419,8 @@ def build_aggregations(details, historical_avg, exchange_rate=None):
     for record in reference_records:
         by_task[key(record["task_card"])].append(record)
     task_rows = []
-    sum_avg_eur = Decimal("0")
+    new_sum_avg_eur = Decimal("0")
+    final_sum_eur = Decimal("0")
     incomplete_tasks = 0
     for task_key, records in by_task.items():
         task_card = next((r["task_card"] for r in records if key(r["task_card"])), None)
@@ -428,28 +429,43 @@ def build_aggregations(details, historical_avg, exchange_rate=None):
         total = sum(complete, Decimal("0"))
         average = total / len(complete) if complete else None
         if average is not None:
-            sum_avg_eur += average
+            new_sum_avg_eur += average
         if incomplete:
             incomplete_tasks += 1
         historical = historical_avg.get(task_key)
-        difference = average - historical if average is not None and historical is not None else None
         status = "COMPLETE" if incomplete == 0 and task_key else "INCOMPLETE"
-        usd = average * exchange_rate if average is not None and exchange_rate is not None else None
+        difference = average - historical if average is not None and historical is not None else None
+        final_price = None
+        selected_source = None
+        if average is not None and historical is not None:
+            if average >= historical:
+                final_price, selected_source = average, "NEW"
+            else:
+                final_price, selected_source = historical, "OLD"
+        elif average is not None:
+            final_price, selected_source = average, "NEW"
+        elif historical is not None:
+            final_price, selected_source = historical, "OLD"
+        if final_price is not None:
+            final_sum_eur += final_price
+        usd = final_price * exchange_rate if final_price is not None and exchange_rate is not None else None
         task_rows.append([
             task_card, len(records), len(complete), incomplete, float(total),
             float(average) if average is not None else None,
             float(historical) if historical is not None else None,
+            float(final_price) if final_price is not None else None, selected_source,
             float(difference) if difference is not None else None,
             float(usd) if usd is not None else None, status,
         ])
     task_rows.sort(key=lambda row: str(row[0] or ""))
-    sum_avg_usd = sum_avg_eur * exchange_rate if exchange_rate is not None else None
+    final_sum_usd = final_sum_eur * exchange_rate if exchange_rate is not None else None
     overall_status = "COMPLETE" if incomplete_tasks == 0 else "INCOMPLETE"
     task_rows.append([
-        "SUM_AVG", None, None, incomplete_tasks, None, float(sum_avg_eur), None, None,
-        float(sum_avg_usd) if sum_avg_usd is not None else None, overall_status,
+        "SUM_AVG", None, None, incomplete_tasks, None, float(new_sum_avg_eur), None,
+        float(final_sum_eur), None, None,
+        float(final_sum_usd) if final_sum_usd is not None else None, overall_status,
     ])
-    return reference_rows, task_rows, float(sum_avg_eur), overall_status
+    return reference_rows, task_rows, float(final_sum_eur), overall_status
 
 
 def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int, inputs=(),
@@ -578,15 +594,16 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
              "candidate_pairs": len(matches), "review_rows": len(review), "uom_variants": len(variants),
              "calculated_rows": calculated_count, "fallback_rows": fallback_count,
              "unresolved_rows": unresolved_count, "missing_uom_rows": missing_uom_count,
-             "sum_avg_eur": sum_avg, "overall_status": overall_status}
+             "final_total_eur": sum_avg, "sum_avg_eur": sum_avg,
+             "overall_status": overall_status}
     wb = Workbook()
     wb.remove(wb.active)
     summary = [
         ["Töödeldud materjaliread", len(stat_rows)], ["Arvutatud read", calculated_count],
         ["Ajaloolise hinna fallback read", fallback_count], ["Puuduva UOM reegli read", missing_uom_count],
         ["Lahendamata read", unresolved_count], ["Reference grupid", len(reference_rows)],
-        ["Task Card grupid", max(0, len(task_rows) - 1)], ["SUM_AVG EUR", sum_avg],
-        ["SUM_AVG USD", float(sum_avg_usd) if sum_avg_usd is not None else None],
+        ["Task Card grupid", max(0, len(task_rows) - 1)], ["Lõplik summa EUR", sum_avg],
+        ["Lõplik summa USD", float(sum_avg_usd) if sum_avg_usd is not None else None],
         ["Koondstaatuse olek", overall_status],
         ["EUR/USD kurss", float(exchange_rate) if exchange_rate is not None else None],
         ["Kursi kuupäev", exchange_date], ["Kursi olek", exchange_status],
@@ -611,8 +628,9 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
     ], reference_rows)
     append_sheet(wb, "Task Card Summary", [
         "task_card", "reference_count", "complete_references", "incomplete_references",
-        "reference_totals_sum_eur", "task_card_avg_eur", "historical_task_card_avg_eur",
-        "difference_to_historical_avg_eur", "task_card_avg_usd", "status",
+        "reference_totals_sum_eur", "new_task_card_avg_eur", "old_task_card_avg_eur",
+        "final_task_card_price_eur", "selected_price_source",
+        "difference_new_minus_old_eur", "final_task_card_price_usd", "status",
     ], task_rows)
     append_sheet(wb, "Exceptions", material_headers, exception_rows)
     for column in (10, 15, 21, 25, 29):

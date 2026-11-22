@@ -44,13 +44,15 @@ teisendab koguse ainult täpse, suunaga UOM-reegli järgi:
 `teisendatud kogus = STAT kogus × rate / exchange_base`. `LT` käsitletakse `L`
 aliasena. Kui AMOS `avg_price` on tühi või null või vajalik UOM-reegel puudub,
 kasutatakse sama STAT-i materjalirea ajaloolist EUR-ühikuhinda (veerus K) 20%
-juurdehindlusega. Task Cardi vana `AVG` on ainult võrdlusnäitaja ning seda ei
-kasutata materjali ühikuhinnana. Kui tootekood puudub AMOS-ist, vasteid on mitu,
+juurdehindlusega. Task Cardi vana `AVG` ei kasutata materjali ühikuhinnana: seda
+võrreldakse alles uue Task Card AVG-ga ning kliendihinnaks valitakse neist suurem.
+Kui tootekood puudub AMOS-ist, vasteid on mitu,
 UOM-reegel on vastuoluline või vajalik ajalooline ühikuhind puudub, jäetakse rida
 käsitsi kontrolli; seda ei muudeta nulliks ega arvata kinnitatud kogusummasse.
 
 Arvutusjärjekord on: materjalirea hind → materjalide summa `Reference` kaupa →
-`Reference` summade keskmine `Task Card` kaupa → `SUM_AVG`. EUR/USD kurss laaditakse
+`Reference` summade keskmine `Task Card` kaupa → `MAX(vana AVG, uus AVG)` →
+lõplike Task Card hindade summa. EUR/USD kurss laaditakse
 automaatselt Euroopa Keskpanga päevakursist; võrguvea korral kasutatakse viimast
 edukalt salvestatud ECB kurssi. Kurss tähendab USD-d ühe EUR-i kohta, seega
 `USD = EUR × EUR/USD`. `approval_limit_eur` on ühikuhinna kontrolllävi, mitte
@@ -79,7 +81,7 @@ python scripts/compare_stat_uom_full.py
 | Книга результата | Назначение |
 | --- | --- |
 | `amos_prepared.xlsx` | `Prepared` содержит одну строку на запись AMOS, обе цены, их исходные значения и состояния. `UOM_Map` хранит правила, исходные факторы, описания и доступные служебные поля. `Issues` и `Summary` показывают причины проверки и контрольные числа. |
-| `STAT_UOM_vordlusraport.xlsx` | Основной итог. `Executive Summary` показывает контрольные числа и `SUM_AVG`; `Material Calculations` — расчёт каждой строки; `Reference Summary` — суммы по Reference; `Task Card Summary` — средние по Task Card и сравнение со старым AVG; `Exceptions` — fallback и строки для ручной проверки. Технические листы сохраняют диагностические связи и проблемы UOM. |
+| `STAT_UOM_vordlusraport.xlsx` | Основной итог. `Executive Summary` показывает контрольные числа и финальную сумму; `Material Calculations` — расчёт каждой строки; `Reference Summary` — суммы по Reference; `Task Card Summary` — новый AVG, старый AVG, выбранный максимум и источник `OLD`/`NEW`; `Exceptions` — fallback и строки для ручной проверки. Технические листы сохраняют диагностические связи и проблемы UOM. |
 | `STAT_UOM_vordlusraport_friend.xlsx` | Подробный отчёт по всем парам STAT × UOM. Сравнивает единицу STAT с внутренней единицей правила. Уникальные артикулы, строки STAT и пары имеют отдельные счётчики. |
 
 Рабочую книгу с формулами храните отдельно от генерируемых результатов. При повторном запуске скрипт заменяет свой отчёт целиком, включая ручные значения в нём. Запись идёт через отдельный временный файл и атомарную замену. Произвольная существующая книга, результат другого скрипта, входной файл, выходной симлинк или существующая книга с формулами ячеек защищены от замены. Для первоначального обновления старые отчёты распознаются по штатному имени и составу листов. Входные книги открываются в режиме чтения. Для входных ячеек с формулами нужен актуальный результат пересчёта, сохранённый Excel.
@@ -93,6 +95,7 @@ python scripts/compare_stat_uom_full.py
 - В `Prepared` поле `uom_status` отражает текстовое совпадение. Для интерпретации используйте также `uom_conversion_status` и оба счётчика кандидатов. Например, совпадение внутренней единицы при нулевом коэффициенте даёт `REVIEW_INVALID_RULE`. Для цен состояния `MISSING`, `ZERO`, `NEGATIVE`, `INVALID` и `POSITIVE` различаются. Сырые цены и ключи остаются доступны для проверки.
 - AMOS `avg_price` применяется только при единственном точном совпадении артикула и совместимых единицах. При нулевой/пустой цене или отсутствии направленного UOM-правила применяется историческая цена именно этой строки STAT с настраиваемой надбавкой. Отсутствующий в AMOS артикул автоматически не оценивается.
 - `Reference Summary` получает сумму только когда рассчитаны все строки Reference. `Task Card Summary` усредняет только полные Reference и явно помечает Task Card как `INCOMPLETE`, если хотя бы один Reference не завершён. Поэтому неполный результат нельзя принять за окончательную цену.
+- Окончательная цена Task Card равна `MAX(старый Task Card AVG, новый Task Card AVG)`. При равенстве источник последовательно отмечается как `NEW`. Если новый расчёт содержит нерешённые строки, максимум всё равно показывается согласно бизнес-правилу, но Task Card и общий результат сохраняют статус `INCOMPLETE`: такую цену нельзя выдавать за полностью проверенную.
 
 ## Проверка
 

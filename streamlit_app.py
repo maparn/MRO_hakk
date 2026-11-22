@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from scripts.exchange_rates import get_ecb_rate
 from scripts.web_processing import process_workbooks
@@ -90,8 +91,8 @@ if result:
     st.success("Raport on valmis.")
     metric_cols = st.columns(4)
     metric_cols[0].metric("Materjaliread", result["stats"]["stat_rows"])
-    metric_cols[1].metric("SUM AVG EUR", f'{total["task_card_avg_eur"]:,.2f} €')
-    metric_cols[2].metric("SUM AVG USD", f'${total["task_card_avg_usd"]:,.2f}')
+    metric_cols[1].metric("Lõppsumma EUR", f'{total["final_task_card_price_eur"]:,.2f} €')
+    metric_cols[2].metric("Lõppsumma USD", f'${total["final_task_card_price_usd"]:,.2f}')
     metric_cols[3].metric(
         "EUR/USD kurss",
         f'{result["exchange"]["rate"]} ({result["exchange"]["status"]})',
@@ -106,9 +107,11 @@ if result:
         "Reference arv": row["reference_count"],
         "Täielikud Reference-id": row["complete_references"],
         "Puudulikud Reference-id": row["incomplete_references"],
-        "Task Card AVG EUR": row["task_card_avg_eur"],
-        "Ajalooline AVG EUR": row["historical_task_card_avg_eur"],
-        "Task Card AVG USD": row["task_card_avg_usd"],
+        "Uus AVG EUR": row["new_task_card_avg_eur"],
+        "Vana AVG EUR": row["old_task_card_avg_eur"],
+        "Lõpphind EUR": row["final_task_card_price_eur"],
+        "Valitud allikas": row["selected_price_source"],
+        "Lõpphind USD": row["final_task_card_price_usd"],
         "Olek": row["status"],
     } for row in services]
     material_table = [{
@@ -135,3 +138,27 @@ if result:
 st.markdown(
     '<p class="privacy">Failid töödeldakse eraldatud ajutises kaustas ja neid ei '
     'salvestata püsivalt serverisse.</p>', unsafe_allow_html=True)
+
+
+st.divider()
+st.subheader("Mõõtühikute teisendamine")
+
+converter_html = (
+    ROOT / "web" / "unit_converter.html"
+).read_text(encoding="utf-8")
+
+converter_js = (
+    ROOT / "web" / "unit_converter.js"
+).read_text(encoding="utf-8")
+
+converter_html = converter_html.replace(
+    '<script src="unit_converter.js"></script>',
+    f"<script>{converter_js}</script>"
+)
+
+with st.expander("Ava ühikute konverter"):
+    components.html(
+        converter_html,
+        height=690,
+        scrolling=True
+    )
