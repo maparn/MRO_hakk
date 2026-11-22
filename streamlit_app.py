@@ -9,7 +9,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from scripts.exchange_rates import get_ecb_rate
-from scripts.web_processing import process_workbooks
+from scripts.web_processing import load_converter_html, process_workbooks
 
 
 ROOT = Path(__file__).resolve().parent
@@ -119,7 +119,11 @@ if result:
         "Task Card": row["task_card"], "Part Number": row["partno"],
         "Kogus": row["original_quantity"], "Ühik": row["original_unit"],
         "Ajalooline hind EUR": row["historical_unit_price_eur"],
-        "AMOS hind EUR": row["amos_avg_price_eur"],
+        "AMOS algne hind EUR": row["amos_avg_price_eur"],
+        "Hind STAT ühikus EUR": row["selected_unit_price_eur"],
+        "Teisendustegur": row["price_conversion_factor"],
+        "Teisenduse allikas": row["conversion_source"],
+        "Teisenduse olek": row["conversion_status"],
         "Rea summa EUR": row["final_line_eur"], "Hinna allikas": row["price_source"],
         "Olek": row["status_et"],
     } for row in result["material_calculations"]]
@@ -138,3 +142,15 @@ if result:
 st.markdown(
     '<p class="privacy">Failid töödeldakse eraldatud ajutises kaustas ja neid ei '
     'salvestata püsivalt serverisse.</p>', unsafe_allow_html=True)
+
+
+st.divider()
+st.subheader("Mõõtühikute teisendamine")
+
+converter_html = load_converter_html(ROOT)
+
+if converter_html is None:
+    st.info("Mõõtühikute konverter ei ole praegu saadaval. Hinnakalkulaator töötab edasi.")
+else:
+    with st.expander("Ava ühikute konverter"):
+        components.html(converter_html, height=690, scrolling=True)

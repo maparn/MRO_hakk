@@ -24,7 +24,23 @@
     "approval_limit_eur": 500,
     "unit_aliases": {
       "LT": "L"
-    }
+    },
+    "approved_physical_price_conversions": [
+      {
+        "amos_unit": "ME",
+        "stat_unit": "MM",
+        "price_multiplier": "0.001",
+        "enabled": false,
+        "approval_reference": "PENDING_CONFIRMATION_THAT_AMOS_ME_MEANS_METRE"
+      },
+      {
+        "amos_unit": "MM",
+        "stat_unit": "ME",
+        "price_multiplier": "1000",
+        "enabled": false,
+        "approval_reference": "PENDING_CONFIRMATION_THAT_AMOS_ME_MEANS_METRE"
+      }
+    ]
   },
   "exchange_rate": {
     "provider": "ECB",

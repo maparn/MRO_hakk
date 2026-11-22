@@ -105,6 +105,11 @@ def main() -> int:
     exchange_config = config.get("exchange_rate", {})
     aliases = rules.get("unit_aliases", {})
     alias_arguments = [item for pair in aliases.items() for item in ("--unit-alias", f"{pair[0]}={pair[1]}")]
+    physical_arguments = [
+        item for record in rules.get("approved_physical_price_conversions", [])
+        if record.get("enabled", False)
+        for item in ("--physical-price-conversion-json", json.dumps(record))
+    ]
     if args.run_tests:
         run([python, "-B", "-m", "unittest", "discover", "-s", "tests", "-q"])
     exchange = get_ecb_rate(
@@ -126,7 +131,7 @@ def main() -> int:
          "--approval-limit", str(rules.get("approval_limit_eur", 500)),
          "--eur-usd-rate", exchange["rate"], "--exchange-date", exchange["date"],
          "--exchange-status", exchange["status"],
-         *alias_arguments, "--output", str(output)])
+         *alias_arguments, *physical_arguments, "--output", str(output)])
 
     print(f"\nVALMIS. Uuendatud raport: {output}")
     return 0

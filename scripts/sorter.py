@@ -10,12 +10,15 @@ Reference totals by Task Card. Technical sheets retain the matching evidence.
 from __future__ import annotations
 
 import argparse
+import json
 import warnings
 from collections import Counter, defaultdict
 from decimal import Decimal
+from itertools import chain, islice
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -28,11 +31,11 @@ warnings.filterwarnings(
 
 if __package__:
     from .amos_prepare import AMOS_FIELDS, open_records, parse_price
-    from .report_io import literal_cell, save_report, validate_output
+    from .report_io import save_report, validate_output
     from .uom_rules import annotate_rules, normalize_key as key, numeric_factor, rule_signature
 else:
     from amos_prepare import AMOS_FIELDS, open_records, parse_price
-    from report_io import literal_cell, save_report, validate_output
+    from report_io import save_report, validate_output
     from uom_rules import annotate_rules, normalize_key as key, numeric_factor, rule_signature
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -48,13 +51,14 @@ STAT_PART_HEADERS = {"PN", "PARTNO", "PART NO", "PART NUMBER"}
 STAT_UNIT_HEADERS = {"UNIT", "MEASURE_UNIT", "MEASURE UNIT", "UOM"}
 
 STATUS_ET = {
-    "CALCULATED_CURRENT_PRICE": "Arvutatud AMOS keskmise hinnaga",
-    "CALCULATED_HISTORICAL_FALLBACK": "Arvutatud ajaloolise ühikuhinnaga ja juurdehindlusega",
+    "CALCULATED_HISTORICAL_MAX": "Valitud kõrgem ajalooline ühikuhind",
+    "CURRENT_AMOS_PRICE": "Arvutatud AMOS keskmise hinnaga",
+    "FALLBACK_APPLIED": "Arvutatud ajaloolise ühikuhinnaga +20%",
     "MANUAL_REVIEW_MISSING_PART_NUMBER": "Puuduv tootekood, vajab käsitsi kontrolli",
     "MANUAL_REVIEW_AMOS_NOT_REQUESTED": "AMOS fail puudub, vajab käsitsi kontrolli",
     "MANUAL_REVIEW_AMOS_RECORD_MISSING": "Tootekood puudub AMOS failist, vajab käsitsi kontrolli",
     "MANUAL_REVIEW_MULTIPLE_AMOS_RECORDS": "AMOS failis on mitu vastet, vajab käsitsi kontrolli",
-    "MANUAL_REVIEW_MISSING_HISTORICAL_PRICE": "Ajalooline ühikuhind puudub, vajab käsitsi kontrolli",
+    "MANUAL_REVIEW_MISSING_HISTORICAL_PRICE": "ANDMED PUUDUVAD — ajalooline ühikuhind puudub",
     "MANUAL_REVIEW_INVALID_QUANTITY": "Kogus puudub või ei ole korrektne",
     "MANUAL_REVIEW_MISSING_UNIT": "Mõõtühik puudub, vajab käsitsi kontrolli",
     "MANUAL_REVIEW_AMBIGUOUS_UOM_RULE": "Mõõtühiku reegel on vastuoluline",
@@ -100,6 +104,12 @@ def read_stat(path: Path, part_col: int, unit_col: int, *, quantity_col: int | N
 
             partno, unit = cell(part_col), cell(unit_col)
             if key(partno) in STAT_PART_HEADERS and key(unit) in STAT_UNIT_HEADERS:
+                continue
+            # Ignore report footers such as GRAND TOTAL / SUM AVERAGE. Keep a
+            # genuinely incomplete material row when it still has material fields.
+            if not any(key(value) for value in (
+                partno, unit, cell(quantity_col or 8), cell(description_col or 7),
+            )):
                 continue
             task_card = cell(task_card_col or 3)
             reference = cell(reference_col or 1)
@@ -160,23 +170,40 @@ def read_uom(path: Path):
         wb.close()
 
 
-def append_sheet(wb, name, header, rows):
+def append_sheet(wb, name, header, rows, number_formats=None):
+    """Stream a styled worksheet so large Work Packages fit web memory limits."""
     ws = wb.create_sheet(name)
-    ws.append(header)
-    widths = [len(str(label)) for label in header]
-    for index, row in enumerate(rows):
-        ws.append([literal_cell(ws, value) for value in row])
-        if index < 100:
-            for i, value in enumerate(row):
-                widths[i] = max(widths[i], len(str(value)) if value is not None else 0)
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    for i, cell in enumerate(ws[1]):
+    number_formats = number_formats or {}
+    iterator = iter(rows)
+    sample = list(islice(iterator, 100))
+    widths = [len(str(label)) for label in header]
+    for row in sample:
+        for i, value in enumerate(row):
+            widths[i] = max(widths[i], len(str(value)) if value is not None else 0)
+    for i, width in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = min(52, max(15, width + 2))
+    styled_header = []
+    for label in header:
+        cell = WriteOnlyCell(ws, value=label)
         cell.fill = PatternFill("solid", fgColor="1F4E78")
         cell.font = Font(bold=True, color="FFFFFF")
-        cell.alignment = Alignment(vertical="center", wrap_text=True)
-        ws.column_dimensions[get_column_letter(i + 1)].width = min(52, max(15, widths[i] + 2))
-    ws.row_dimensions[1].height = 32
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        styled_header.append(cell)
+    ws.append(styled_header)
+    row_count = 0
+    for row in chain(sample, iterator):
+        cells = []
+        for column, value in enumerate(row, 1):
+            cell = WriteOnlyCell(ws, value=value)
+            if isinstance(value, str):
+                cell.data_type = "s"
+            if column in number_formats and value is not None:
+                cell.number_format = number_formats[column]
+            cells.append(cell)
+        ws.append(cells)
+        row_count += 1
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(header))}{row_count + 1}"
     return ws
 
 
@@ -252,6 +279,29 @@ def parse_unit_aliases(items):
     return aliases
 
 
+def parse_physical_price_conversions(records):
+    """Validate explicitly approved AMOS-price-unit to STAT-price-unit mappings."""
+    conversions = {}
+    for record in records or ():
+        if not record.get("enabled", False):
+            continue
+        amos_unit = key(record.get("amos_unit"))
+        stat_unit = key(record.get("stat_unit"))
+        multiplier = numeric_factor(record.get("price_multiplier"))
+        approval = str(record.get("approval_reference") or "").strip()
+        if not amos_unit or not stat_unit or multiplier is None or multiplier <= 0:
+            raise ValueError("Approved physical conversion requires units and a positive price_multiplier")
+        if not approval or approval.upper().startswith("PENDING"):
+            raise ValueError("Enabled physical conversion requires approval_reference")
+        conversion_key = (amos_unit, stat_unit)
+        if conversion_key in conversions:
+            raise ValueError(f"Duplicate physical conversion: {amos_unit}>{stat_unit}")
+        conversions[conversion_key] = {
+            "price_multiplier": multiplier, "approval_reference": approval,
+        }
+    return conversions
+
+
 def read_historical_avg(path: Path, sheet_name: str):
     """Read the historical service average keyed by Task Card."""
     wb = load_workbook(path, read_only=True, data_only=True)
@@ -281,7 +331,8 @@ def read_historical_avg(path: Path, sheet_name: str):
         wb.close()
 
 
-def calculate_line(stat, uoms, amos_index, aliases, fallback_markup=Decimal("20")):
+def calculate_line(stat, uoms, amos_index, aliases, fallback_markup=Decimal("20"),
+                   physical_conversions=None):
     """Calculate one material row in EUR using current price or row-level legacy fallback."""
     historical_price, historical_state = parse_price(stat.get("historical_unit_price_eur"))
     result = {
@@ -290,11 +341,15 @@ def calculate_line(stat, uoms, amos_index, aliases, fallback_markup=Decimal("20"
         "conversion_rate": None,
         "conversion_base": None,
         "conversion_status": "NOT_CALCULATED",
+        "price_conversion_factor": None,
+        "conversion_source": None,
         "unit_price_eur": None,
         "price_source": None,
         "line_total_eur": None,
         "calculation_status": "NOT_CALCULATED",
         "avg_price_state": None,
+        "current_price_status": "MANUAL_REVIEW_REQUIRED",
+        "fallback_status": "NOT_APPLIED",
         "historical_unit_price_eur": historical_price,
         "historical_price_state": historical_state,
         "selected_unit_price_eur": None,
@@ -307,7 +362,11 @@ def calculate_line(stat, uoms, amos_index, aliases, fallback_markup=Decimal("20"
 
     def unresolved(status, reason=None):
         result.update(calculation_status=status, fallback_reason=reason,
-                      price_source="MANUAL_REVIEW_REQUIRED", review_required=True)
+                      price_source="MANUAL_REVIEW_REQUIRED",
+                      fallback_status=("MISSING_HISTORICAL_PRICE"
+                                       if status == "MANUAL_REVIEW_MISSING_HISTORICAL_PRICE"
+                                       else "MANUAL_REVIEW_REQUIRED"),
+                      review_required=True)
         return result
 
     def historical_fallback(reason):
@@ -320,10 +379,44 @@ def calculate_line(stat, uoms, amos_index, aliases, fallback_markup=Decimal("20"
         total = quantity * selected
         result.update(
             converted_quantity=float(quantity), conversion_status="NOT_APPLICABLE_FALLBACK",
+            price_conversion_factor=1.0, conversion_source="HISTORICAL_FALLBACK",
             unit_price_eur=float(selected), selected_unit_price_eur=float(selected),
-            price_source="HISTORICAL_UNIT_PRICE_PLUS_MARKUP",
+            price_source="HISTORICAL_PRICE_PLUS_20_PERCENT",
             applied_markup_percent=float(fallback_markup), fallback_reason=reason,
-            line_total_eur=float(total), calculation_status="CALCULATED_HISTORICAL_FALLBACK",
+            line_total_eur=float(total), calculation_status="FALLBACK_APPLIED",
+            fallback_status="HISTORICAL_FALLBACK_APPLIED", review_required=False,
+        )
+        return result
+
+    def select_max_current_price(current_stat_unit_price, converted_quantity):
+        # Compare historical and AMOS prices in the same STAT unit.
+        historical = (
+            Decimal(str(historical_price))
+            if historical_state == "POSITIVE"
+            else None
+        )
+
+        use_old = (
+            historical is not None
+            and historical > current_stat_unit_price
+        )
+
+        chosen = historical if use_old else current_stat_unit_price
+
+        result.update(
+            converted_quantity=float(converted_quantity),
+            unit_price_eur=float(chosen),
+            selected_unit_price_eur=float(chosen),
+            price_source=(
+                "HISTORICAL_UNIT_PRICE"
+                if use_old else "CURRENT_AMOS_PRICE"
+            ),
+            applied_markup_percent=0.0,
+            line_total_eur=float(quantity * chosen),
+            calculation_status=(
+                "CALCULATED_HISTORICAL_MAX"
+                if use_old else "CURRENT_AMOS_PRICE"
+            ),
             review_required=False,
         )
         return result
@@ -334,14 +427,22 @@ def calculate_line(stat, uoms, amos_index, aliases, fallback_markup=Decimal("20"
         return unresolved("MANUAL_REVIEW_AMOS_NOT_REQUESTED")
     amos_rows = amos_index.get(stat["part_key"], [])
     if not amos_rows:
+        result["current_price_status"] = "MATERIAL_NOT_FOUND"
         return unresolved("MANUAL_REVIEW_AMOS_RECORD_MISSING", "AMOS_RECORD_MISSING")
     if len(amos_rows) != 1:
         return unresolved("MANUAL_REVIEW_MULTIPLE_AMOS_RECORDS", "MULTIPLE_AMOS_RECORDS")
     amos_row = amos_rows[0]
     price, price_state = parse_price(amos_row["avg_price"])
     result["avg_price_state"] = price_state
+    result["current_price_status"] = {
+        "POSITIVE": "CURRENT_PRICE_VALID", "ZERO": "CURRENT_PRICE_ZERO",
+        "MISSING": "CURRENT_PRICE_MISSING", "INVALID": "CURRENT_PRICE_INVALID",
+        "NEGATIVE": "CURRENT_PRICE_INVALID",
+    }[price_state]
     if price_state != "POSITIVE":
-        return historical_fallback(f"AMOS_AVG_PRICE_{price_state}")
+        reason = {"ZERO": "CURRENT_PRICE_ZERO", "MISSING": "MISSING_CURRENT_PRICE",
+                  "INVALID": "INVALID_PRICE", "NEGATIVE": "INVALID_PRICE"}[price_state]
+        return historical_fallback(reason)
 
     if quantity is None or quantity < 0:
         return unresolved("MANUAL_REVIEW_INVALID_QUANTITY")
@@ -351,7 +452,10 @@ def calculate_line(stat, uoms, amos_index, aliases, fallback_markup=Decimal("20"
         return unresolved("MANUAL_REVIEW_MISSING_UNIT")
     if source_unit == target_unit:
         converted = quantity
+        price_factor = Decimal("1")
         result.update(conversion_rate=1.0, conversion_base=1.0,
+                      conversion_source=("UNIT_ALIAS" if source_unit != stat["unit_key"]
+                                         else "IDENTICAL_UNIT"),
                       conversion_status=("UNIT_ALIAS_APPLIED"
                                          if source_unit != stat["unit_key"] else "SAME_UNIT"))
     else:
@@ -363,7 +467,19 @@ def calculate_line(stat, uoms, amos_index, aliases, fallback_markup=Decimal("20"
         matching = [row for row in candidates if not row["rule_issues"]]
         if len(matching) != 1:
             if not candidates:
-                return historical_fallback("MISSING_UOM_RULE")
+                physical = (physical_conversions or {}).get((target_unit, source_unit))
+                if physical is None:
+                    return historical_fallback("MISSING_UOM_RULE")
+                price_factor = physical["price_multiplier"]
+                converted = quantity
+                result.update(
+                    conversion_status="APPROVED_PHYSICAL_PRICE_CONVERSION",
+                    price_conversion_factor=float(price_factor),
+                    conversion_source="APPROVED_PHYSICAL_CONFIG",
+                    fallback_reason=None,
+                )
+                selected = Decimal(str(price)) * price_factor
+                return select_max_current_price(selected, quantity)
             if len(candidates) > 1 or any("CONFLICTING_UOM_RULES" in row["rule_issues"]
                                         for row in candidates):
                 return unresolved("MANUAL_REVIEW_AMBIGUOUS_UOM_RULE", "AMBIGUOUS_UOM_RULE")
@@ -371,16 +487,14 @@ def calculate_line(stat, uoms, amos_index, aliases, fallback_markup=Decimal("20"
         rule = matching[0]
         rate = numeric_factor(rule["rate"])
         base = numeric_factor(rule["exchange_base"])
-        converted = quantity * rate / base
+        price_factor = rate / base
+        converted = quantity * price_factor
         result.update(conversion_rate=float(rate), conversion_base=float(base),
-                      conversion_status="CONVERSION_APPLIED")
+                      price_conversion_factor=float(price_factor),
+                      conversion_source="AMOS_UOM_RULE", conversion_status="CONVERSION_APPLIED")
 
-    total = converted * Decimal(str(price))
-    result.update(converted_quantity=float(converted), unit_price_eur=price,
-                  selected_unit_price_eur=price, price_source="AMOS_AVG_PRICE",
-                  applied_markup_percent=0.0, line_total_eur=float(total),
-                  calculation_status="CALCULATED_CURRENT_PRICE", review_required=False)
-    return result
+    selected = Decimal(str(price)) * price_factor
+    return select_max_current_price(selected, converted)
 
 
 def build_aggregations(details, historical_avg, exchange_rate=None):
@@ -396,7 +510,7 @@ def build_aggregations(details, historical_avg, exchange_rate=None):
         task_card = next((s.get("task_card") for s, _ in entries if key(s.get("task_card"))), None)
         totals = [Decimal(str(c["line_total_eur"])) for _, c in entries
                   if c["line_total_eur"] is not None]
-        fallback_rows = sum(c["price_source"] == "HISTORICAL_UNIT_PRICE_PLUS_MARKUP"
+        fallback_rows = sum(c["price_source"] == "HISTORICAL_PRICE_PLUS_20_PERCENT"
                             for _, c in entries)
         unresolved_rows = sum(c["line_total_eur"] is None for _, c in entries)
         subtotal = sum(totals, Decimal("0"))
@@ -471,7 +585,8 @@ def build_aggregations(details, historical_avg, exchange_rate=None):
 def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int, inputs=(),
                  *, amos_index=None, historical_avg=None, fallback_markup=Decimal("20"), aliases=None,
                  approval_limit=Decimal("500"), exchange_rate=None, exchange_date=None,
-                 exchange_status="NOT_CONFIGURED", project_root=PROJECT):
+                 exchange_status="NOT_CONFIGURED", physical_conversions=None,
+                 project_root=PROJECT):
     historical_avg = historical_avg or {}
     aliases = aliases or {}
     if not all("rule_issues" in row and "measure_unit_ext" in row for row in uom_rows):
@@ -504,7 +619,8 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
         candidates = [(r, match_side(unit, r)) for r in uoms]
         matched = [(r, side) for r, side in candidates if side != "NONE"]
         status = decide(stat, uoms, matched)
-        calculation = calculate_line(stat, uoms, amos_index, aliases, fallback_markup)
+        calculation = calculate_line(stat, uoms, amos_index, aliases, fallback_markup,
+                                     physical_conversions)
         if calculation["conversion_status"] in {"SAME_UNIT", "UNIT_ALIAS_APPLIED"}:
             status = calculation["conversion_status"]
         calculation_details.append((stat, calculation))
@@ -531,10 +647,15 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
             stat.get("factor"), stat.get("partno"), stat.get("description"),
             stat.get("stat_quantity"), stat.get("unit"),
             calculation["historical_unit_price_eur"], calculation["historical_price_state"],
+            calculation["current_price_status"], calculation["fallback_status"],
             evidence[0], evidence[1], evidence[2], evidence[3], evidence[4],
             calculation["effective_stat_unit"], calculation["conversion_rate"],
             calculation["conversion_base"], calculation["converted_quantity"],
-            calculation["selected_unit_price_eur"], calculation["price_source"],
+            calculation["price_conversion_factor"], calculation["conversion_source"],
+            calculation["conversion_status"],
+            (calculation["selected_unit_price_eur"]
+             if calculation["selected_unit_price_eur"] is not None else "ANDMED PUUDUVAD"),
+            calculation["price_source"],
             calculation["applied_markup_percent"], calculation["fallback_reason"],
             calculation["line_total_eur"], "EUR", calculation["calculation_status"],
             STATUS_ET.get(calculation["calculation_status"], calculation["calculation_status"]),
@@ -543,7 +664,7 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
         ]
         material_rows.append(material_row)
         if (calculation["review_required"]
-                or calculation["price_source"] == "HISTORICAL_UNIT_PRICE_PLUS_MARKUP"
+                or calculation["price_source"] == "HISTORICAL_PRICE_PLUS_20_PERCENT"
                 or approval_status == "REVIEW_OVER_THRESHOLD"):
             exception_rows.append(material_row)
         # Every row here is a possible lookup alternative linked to one STAT row.
@@ -581,7 +702,7 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
                 "; ".join(r["rule_issues"])] for r in uom_rows if r["rule_issues"])
 
     calculated_count = sum(c["line_total_eur"] is not None for _, c in calculation_details)
-    fallback_count = sum(c["price_source"] == "HISTORICAL_UNIT_PRICE_PLUS_MARKUP"
+    fallback_count = sum(c["price_source"] == "HISTORICAL_PRICE_PLUS_20_PERCENT"
                          for _, c in calculation_details)
     unresolved_count = len(stat_rows) - calculated_count
     missing_uom_count = sum(c["fallback_reason"] == "MISSING_UOM_RULE"
@@ -596,8 +717,7 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
              "unresolved_rows": unresolved_count, "missing_uom_rows": missing_uom_count,
              "final_total_eur": sum_avg, "sum_avg_eur": sum_avg,
              "overall_status": overall_status}
-    wb = Workbook()
-    wb.remove(wb.active)
+    wb = Workbook(write_only=True)
     summary = [
         ["Töödeldud materjaliread", len(stat_rows)], ["Arvutatud read", calculated_count],
         ["Ajaloolise hinna fallback read", fallback_count], ["Puuduva UOM reegli read", missing_uom_count],
@@ -615,13 +735,18 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
     material_headers = [
         "source_row", "reference", "task_card", "nrc", "factor", "partno", "description",
         "original_quantity", "original_unit", "historical_unit_price_eur", "historical_price_state",
+        "current_price_status", "fallback_status",
         "amos_lookup_status", "amos_source_row", "amos_unit", "amos_avg_price_eur", "amos_price_state",
         "effective_source_unit", "conversion_rate", "conversion_base", "converted_quantity",
+        "price_conversion_factor", "conversion_source", "conversion_status",
         "selected_unit_price_eur", "price_source", "applied_markup_percent", "fallback_reason",
         "final_line_eur", "currency", "calculation_status", "status_et",
         "approval_threshold_eur", "approval_status", "review_required",
     ]
-    material_sheet = append_sheet(wb, "Material Calculations", material_headers, material_rows)
+    eur_format = '#,##0.00 "EUR"'
+    append_sheet(wb, "Material Calculations", material_headers, material_rows,
+                 {10: eur_format, 17: eur_format, 26: eur_format,
+                  30: eur_format, 34: eur_format})
     append_sheet(wb, "Reference Summary", [
         "reference", "task_card", "material_rows", "calculated_rows", "fallback_rows",
         "unresolved_rows", "calculated_subtotal_eur", "reference_total_eur", "status",
@@ -631,12 +756,9 @@ def build_report(stat_rows, uom_rows, output: Path, stat_col: int, unit_col: int
         "reference_totals_sum_eur", "new_task_card_avg_eur", "old_task_card_avg_eur",
         "final_task_card_price_eur", "selected_price_source",
         "difference_new_minus_old_eur", "final_task_card_price_usd", "status",
-    ], task_rows)
+    ], task_rows, {5: eur_format, 6: eur_format, 7: eur_format, 8: eur_format,
+                   10: eur_format, 11: '#,##0.00 "USD"'})
     append_sheet(wb, "Exceptions", material_headers, exception_rows)
-    for column in (10, 15, 21, 25, 29):
-        for cells in material_sheet.iter_cols(min_col=column, max_col=column, min_row=2):
-            for cell in cells:
-                cell.number_format = '#,##0.00 "EUR"'
     append_sheet(wb, "STAT decisions", ["stat_row", "partno", "stat_unit", "part_rule_rows",
         "unit_match_rows", "clean_unit_match_rows", "unit_decision", "conversion_approved",
         "stat_quantity", "task_card", "reference", "amos_lookup_status", "amos_source_row", "amos_unit",
@@ -687,6 +809,8 @@ def main():
     parser.add_argument("--exchange-date", help="Exchange-rate date")
     parser.add_argument("--exchange-status", default="NOT_CONFIGURED")
     parser.add_argument("--unit-alias", action="append", default=[], help="Unit alias, for example LT=L")
+    parser.add_argument("--physical-price-conversion-json", action="append", default=[],
+                        help="Enabled approved physical price conversion as JSON")
     parser.add_argument("--output", type=Path, default=OUTPUT_DEFAULT, help="Raporti Excel faili tee")
     parser.add_argument("--part-col", type=int, default=STAT_PARTNO_COL, help="STAT partno veerg (F=6)")
     parser.add_argument("--unit-col", type=int, default=STAT_UNIT_COL, help="STAT ühiku veerg (I=9)")
@@ -709,11 +833,14 @@ def main():
     uom_rows = read_uom(uom_path)
     historical_avg = read_historical_avg(stat_path, args.historical_sheet)
     aliases = parse_unit_aliases(args.unit_alias)
+    physical_conversions = parse_physical_price_conversions(
+        [json.loads(item) for item in args.physical_price_conversion_json])
     stats = build_report(stat_rows, uom_rows, args.output, args.part_col, args.unit_col, inputs,
                          amos_index=amos_index, historical_avg=historical_avg,
                          fallback_markup=args.fallback_markup, aliases=aliases,
                          approval_limit=args.approval_limit, exchange_rate=args.eur_usd_rate,
-                         exchange_date=args.exchange_date, exchange_status=args.exchange_status)
+                         exchange_date=args.exchange_date, exchange_status=args.exchange_status,
+                         physical_conversions=physical_conversions)
     print(f"Raport salvestatud: {args.output}")
     for label, value in stats.items():
         print(f"{label}: {value}")

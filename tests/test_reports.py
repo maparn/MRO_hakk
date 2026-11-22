@@ -14,8 +14,8 @@ from openpyxl import Workbook, load_workbook
 
 from scripts.report_io import literal_cell, save_report, validate_output
 from scripts.exchange_rates import parse_ecb_rate
-from scripts.sorter import build_aggregations, calculate_line
-from scripts.web_processing import process_workbooks
+from scripts.sorter import build_aggregations, calculate_line, parse_physical_price_conversions
+from scripts.web_processing import load_converter_html, process_workbooks
 from scripts.uom_rules import annotate_rules
 
 
@@ -209,7 +209,7 @@ class ReportIntegration(unittest.TestCase):
         stat = self.stat_line(quantity=3)
         result = calculate_line(stat, [], {"PART": [{"measure_unit": "EA", "avg_price": 7}]}, {})
         self.assertEqual(result["line_total_eur"], 21)
-        self.assertEqual(result["price_source"], "AMOS_AVG_PRICE")
+        self.assertEqual(result["price_source"], "CURRENT_AMOS_PRICE")
         self.assertEqual(result["conversion_status"], "SAME_UNIT")
 
     def test_zero_current_price_uses_row_historical_price_plus_markup(self):
@@ -218,15 +218,42 @@ class ReportIntegration(unittest.TestCase):
                                 Decimal("20"))
         self.assertEqual(result["selected_unit_price_eur"], 12)
         self.assertEqual(result["line_total_eur"], 36)
-        self.assertEqual(result["price_source"], "HISTORICAL_UNIT_PRICE_PLUS_MARKUP")
-        self.assertEqual(result["fallback_reason"], "AMOS_AVG_PRICE_ZERO")
+        self.assertEqual(result["price_source"], "HISTORICAL_PRICE_PLUS_20_PERCENT")
+        self.assertEqual(result["fallback_reason"], "CURRENT_PRICE_ZERO")
+        self.assertEqual(result["calculation_status"], "FALLBACK_APPLIED")
+        self.assertEqual(result["current_price_status"], "CURRENT_PRICE_ZERO")
+
+    def test_historical_markup_is_applied_exactly_once(self):
+        result = calculate_line(
+            self.stat_line(quantity=3, historical=50), [],
+            {"PART": [{"measure_unit": "EA", "avg_price": 0}]}, {}, Decimal("20"),
+        )
+        self.assertEqual(result["selected_unit_price_eur"], 60)
+        self.assertEqual(result["line_total_eur"], 180)
 
     def test_blank_current_price_uses_row_historical_price_plus_markup(self):
         stat = self.stat_line(quantity=2, historical=15)
         result = calculate_line(stat, [], {"PART": [{"measure_unit": "EA", "avg_price": None}]}, {},
                                 Decimal("20"))
         self.assertEqual(result["line_total_eur"], 36)
-        self.assertEqual(result["fallback_reason"], "AMOS_AVG_PRICE_MISSING")
+        self.assertEqual(result["fallback_reason"], "MISSING_CURRENT_PRICE")
+
+    def test_missing_historical_price_does_not_block_valid_current_price(self):
+        result = calculate_line(
+            self.stat_line(quantity=3, historical=None), [],
+            {"PART": [{"measure_unit": "EA", "avg_price": 7.5}]}, {})
+        self.assertEqual(result["selected_unit_price_eur"], 7.5)
+        self.assertEqual(result["line_total_eur"], 22.5)
+        self.assertEqual(result["price_source"], "CURRENT_AMOS_PRICE")
+
+    def test_both_current_and_historical_prices_missing_require_review(self):
+        result = calculate_line(
+            self.stat_line(quantity=3, historical=None), [],
+            {"PART": [{"measure_unit": "EA", "avg_price": None}]}, {})
+        self.assertIsNone(result["selected_unit_price_eur"])
+        self.assertEqual(result["current_price_status"], "CURRENT_PRICE_MISSING")
+        self.assertEqual(result["fallback_status"], "MISSING_HISTORICAL_PRICE")
+        self.assertEqual(result["calculation_status"], "MANUAL_REVIEW_MISSING_HISTORICAL_PRICE")
 
     def test_missing_uom_rule_uses_real_world_row_level_fallback(self):
         stat = self.stat_line(part="17-4PH/CRES/AMS5643BAR/0.5", unit="MM",
@@ -237,18 +264,33 @@ class ReportIntegration(unittest.TestCase):
         self.assertAlmostEqual(result["line_total_eur"], 4440.24)
         self.assertEqual(result["fallback_reason"], "MISSING_UOM_RULE")
         self.assertEqual(result["conversion_status"], "NOT_APPLICABLE_FALLBACK")
+        self.assertEqual(result["fallback_status"], "HISTORICAL_FALLBACK_APPLIED")
 
     def test_missing_uom_and_historical_price_requires_manual_review(self):
         stat = self.stat_line(unit="MM", historical=None)
         result = calculate_line(stat, [], {"PART": [{"measure_unit": "ME", "avg_price": 10}]}, {})
         self.assertIsNone(result["line_total_eur"])
         self.assertEqual(result["calculation_status"], "MANUAL_REVIEW_MISSING_HISTORICAL_PRICE")
+        self.assertEqual(result["fallback_status"], "MISSING_HISTORICAL_PRICE")
 
     def test_absent_amos_record_is_not_silently_approved_from_history(self):
         result = calculate_line(self.stat_line(historical=25), [], {}, {})
         self.assertIsNone(result["line_total_eur"])
         self.assertEqual(result["calculation_status"], "MANUAL_REVIEW_AMOS_RECORD_MISSING")
         self.assertTrue(result["review_required"])
+        self.assertEqual(result["current_price_status"], "MATERIAL_NOT_FOUND")
+
+    def test_stat_footer_is_not_counted_as_a_material(self):
+        workbook(self.stat, "INITIAL", [
+            ("Reference", None, "TaskCard", None, None, "PN", "Description", "Qty", "Unit"),
+            ("REF", None, "TASK", None, None, "PART", "Material", 2, "EA"),
+            (None, None, None, None, None, None, None, None, None,
+             None, None, None, None, None, None, None, "GRAND TOTAL:", "=SUM(R2:R2)"),
+        ])
+        from scripts.sorter import read_stat
+        rows = read_stat(self.stat, 6, 9, quantity_col=8, task_card_col=3, reference_col=1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["part_key"], "PART")
 
     def test_similar_part_numbers_never_match(self):
         stat = self.stat_line(part="9MK619321-1")
@@ -295,11 +337,11 @@ class ReportIntegration(unittest.TestCase):
     def test_reference_sum_then_task_card_average(self):
         details = [
             (self.stat_line(reference="REF-A", task_card="TASK", quantity=1),
-             {"line_total_eur": 100, "price_source": "AMOS_AVG_PRICE"}),
+             {"line_total_eur": 100, "price_source": "CURRENT_AMOS_PRICE"}),
             (self.stat_line(reference="REF-A", task_card="TASK", quantity=1),
-             {"line_total_eur": 50, "price_source": "HISTORICAL_UNIT_PRICE_PLUS_MARKUP"}),
+             {"line_total_eur": 50, "price_source": "HISTORICAL_PRICE_PLUS_20_PERCENT"}),
             (self.stat_line(reference="REF-B", task_card="TASK", quantity=1),
-             {"line_total_eur": 250, "price_source": "AMOS_AVG_PRICE"}),
+             {"line_total_eur": 250, "price_source": "CURRENT_AMOS_PRICE"}),
         ]
         refs, tasks, sum_avg, status = build_aggregations(details, {}, Decimal("1.2"))
         self.assertEqual([row[7] for row in refs], [150, 250])
@@ -313,11 +355,11 @@ class ReportIntegration(unittest.TestCase):
     def test_higher_old_or_new_task_card_avg_is_selected(self):
         details = [
             (self.stat_line(reference="REF-A", task_card="TASK-NEW"),
-             {"line_total_eur": 650, "price_source": "AMOS_AVG_PRICE"}),
+             {"line_total_eur": 650, "price_source": "CURRENT_AMOS_PRICE"}),
             (self.stat_line(reference="REF-B", task_card="TASK-OLD"),
-             {"line_total_eur": 600, "price_source": "AMOS_AVG_PRICE"}),
+             {"line_total_eur": 600, "price_source": "CURRENT_AMOS_PRICE"}),
             (self.stat_line(reference="REF-C", task_card="TASK-EQUAL"),
-             {"line_total_eur": 300, "price_source": "AMOS_AVG_PRICE"}),
+             {"line_total_eur": 300, "price_source": "CURRENT_AMOS_PRICE"}),
         ]
         old = {"TASK-NEW": Decimal("500"), "TASK-OLD": Decimal("800"),
                "TASK-EQUAL": Decimal("300")}
@@ -333,11 +375,11 @@ class ReportIntegration(unittest.TestCase):
     def test_distinct_task_cards_never_mix_reference_totals(self):
         details = [
             (self.stat_line(reference="REF-A", task_card="TASK-1"),
-             {"line_total_eur": 100, "price_source": "AMOS_AVG_PRICE"}),
+             {"line_total_eur": 100, "price_source": "CURRENT_AMOS_PRICE"}),
             (self.stat_line(reference="REF-B", task_card="TASK-1"),
-             {"line_total_eur": 300, "price_source": "AMOS_AVG_PRICE"}),
+             {"line_total_eur": 300, "price_source": "CURRENT_AMOS_PRICE"}),
             (self.stat_line(reference="REF-A", task_card="TASK-2"),
-             {"line_total_eur": 900, "price_source": "AMOS_AVG_PRICE"}),
+             {"line_total_eur": 900, "price_source": "CURRENT_AMOS_PRICE"}),
         ]
         _, tasks, _, _ = build_aggregations(details, {}, None)
         by_task = {row[0]: row for row in tasks[:-1]}
@@ -358,7 +400,7 @@ class ReportIntegration(unittest.TestCase):
     def test_incomplete_new_avg_still_selects_max_but_remains_flagged(self):
         details = [
             (self.stat_line(reference="REF-A", task_card="TASK"),
-             {"line_total_eur": 900, "price_source": "AMOS_AVG_PRICE"}),
+             {"line_total_eur": 900, "price_source": "CURRENT_AMOS_PRICE"}),
             (self.stat_line(reference="REF-B", task_card="TASK"),
              {"line_total_eur": None, "price_source": "MANUAL_REVIEW_REQUIRED"}),
         ]
@@ -371,11 +413,24 @@ class ReportIntegration(unittest.TestCase):
         self.assertEqual(status, "INCOMPLETE")
 
     def test_missing_exchange_rate_keeps_eur_and_leaves_usd_blank(self):
-        details = [(self.stat_line(), {"line_total_eur": 100, "price_source": "AMOS_AVG_PRICE"})]
+        details = [(self.stat_line(), {"line_total_eur": 100, "price_source": "CURRENT_AMOS_PRICE"})]
         _, tasks, sum_avg, status = build_aggregations(details, {}, None)
         self.assertEqual(sum_avg, 100)
         self.assertIsNone(tasks[0][10])
         self.assertEqual(status, "COMPLETE")
+
+    def test_missing_old_avg_uses_new_and_missing_new_uses_old(self):
+        calculated = [(self.stat_line(task_card="NEW"),
+                       {"line_total_eur": 125, "price_source": "CURRENT_AMOS_PRICE"})]
+        _, tasks, total, _ = build_aggregations(calculated, {}, Decimal("1.2"))
+        self.assertEqual((tasks[0][7], tasks[0][8], tasks[0][10]), (125, "NEW", 150))
+        unresolved = [(self.stat_line(task_card="OLD"),
+                       {"line_total_eur": None, "price_source": "MANUAL_REVIEW_REQUIRED"})]
+        _, tasks, total, status = build_aggregations(
+            unresolved, {"OLD": Decimal("400")}, Decimal("1.2"))
+        self.assertEqual((tasks[0][7], tasks[0][8], tasks[0][10]), (400, "OLD", 480))
+        self.assertEqual(total, 400)
+        self.assertEqual(status, "INCOMPLETE")
 
     def test_uom_rate_and_exchange_base_are_applied_in_the_documented_direction(self):
         stat = {
@@ -391,7 +446,68 @@ class ReportIntegration(unittest.TestCase):
         self.assertEqual(result["conversion_rate"], 305)
         self.assertEqual(result["conversion_base"], 10)
         self.assertEqual(result["line_total_eur"], 610)
-        self.assertEqual(result["calculation_status"], "CALCULATED_CURRENT_PRICE")
+        self.assertEqual(result["selected_unit_price_eur"], 61)
+        self.assertEqual(result["price_conversion_factor"], 30.5)
+        self.assertEqual(result["conversion_source"], "AMOS_UOM_RULE")
+        self.assertEqual(result["calculation_status"], "CURRENT_AMOS_PRICE")
+
+    def test_approved_physical_me_price_is_converted_to_mm_without_changing_quantity(self):
+        stat = self.stat_line(part="BAR", unit="MM", quantity=70, historical=52.86)
+        conversions = parse_physical_price_conversions([{
+            "amos_unit": "ME", "stat_unit": "MM", "price_multiplier": "0.001",
+            "enabled": True, "approval_reference": "TEST_APPROVAL",
+        }])
+        result = calculate_line(
+            stat, [], {"BAR": [{"measure_unit": "ME", "avg_price": 254.44}]}, {},
+            Decimal("20"), conversions)
+        self.assertEqual(result["converted_quantity"], 70)
+        self.assertAlmostEqual(result["selected_unit_price_eur"], 0.25444)
+        self.assertAlmostEqual(result["line_total_eur"], 17.8108)
+        self.assertEqual(result["conversion_source"], "APPROVED_PHYSICAL_CONFIG")
+        self.assertEqual(result["conversion_status"], "APPROVED_PHYSICAL_PRICE_CONVERSION")
+
+    def test_approved_physical_mm_price_is_converted_to_me(self):
+        stat = self.stat_line(part="BAR", unit="ME", quantity=2, historical=50)
+        conversions = parse_physical_price_conversions([{
+            "amos_unit": "MM", "stat_unit": "ME", "price_multiplier": "1000",
+            "enabled": True, "approval_reference": "TEST_APPROVAL",
+        }])
+        result = calculate_line(
+            stat, [], {"BAR": [{"measure_unit": "MM", "avg_price": 0.25}]}, {},
+            Decimal("20"), conversions)
+        self.assertEqual(result["converted_quantity"], 2)
+        self.assertEqual(result["selected_unit_price_eur"], 250)
+        self.assertEqual(result["line_total_eur"], 500)
+
+    def test_disabled_physical_conversion_preserves_historical_fallback(self):
+        records = [{"amos_unit": "ME", "stat_unit": "MM", "price_multiplier": "0.001",
+                    "enabled": False, "approval_reference": "PENDING"}]
+        conversions = parse_physical_price_conversions(records)
+        result = calculate_line(
+            self.stat_line(part="BAR", unit="MM", quantity=70, historical=52.86), [],
+            {"BAR": [{"measure_unit": "ME", "avg_price": 254.44}]}, {}, Decimal("20"),
+            conversions)
+        self.assertAlmostEqual(result["line_total_eur"], 4440.24)
+        self.assertEqual(result["fallback_reason"], "MISSING_UOM_RULE")
+
+    def test_pending_physical_conversion_cannot_be_enabled_accidentally(self):
+        with self.assertRaises(ValueError):
+            parse_physical_price_conversions([{
+                "amos_unit": "ME", "stat_unit": "MM", "price_multiplier": "0.001",
+                "enabled": True, "approval_reference": "PENDING_CONFIRMATION",
+            }])
+
+    def test_physical_conversion_is_not_applied_when_official_rule_exists(self):
+        stat = self.stat_line(part="BAR", unit="MM", quantity=70, historical=52.86)
+        official = [{"external": "MM", "internal": "ME", "rate": 1,
+                     "exchange_base": 1000, "rule_issues": ()}]
+        conversions = {("ME", "MM"): {"price_multiplier": Decimal("0.002"),
+                                         "approval_reference": "TEST"}}
+        result = calculate_line(
+            stat, official, {"BAR": [{"measure_unit": "ME", "avg_price": 254.44}]}, {},
+            Decimal("20"), conversions)
+        self.assertAlmostEqual(result["selected_unit_price_eur"], 0.25444)
+        self.assertEqual(result["conversion_source"], "AMOS_UOM_RULE")
 
     def test_unit_alias_preserves_quantity_before_price_multiplication(self):
         stat = {
@@ -438,3 +554,77 @@ class ReportIntegration(unittest.TestCase):
         self.assertEqual(result["summary"][-1]["final_task_card_price_eur"], 34.85)
         self.assertEqual(result["exchange"]["status"], "TEST")
         self.assertEqual(len(result["material_calculations"]), 3)
+
+    def test_zero_price_fallback_and_missing_data_are_transferred_to_web_report(self):
+        workbook(self.amos, "Sheet1", [
+            ("partno", "description", "measure_unit", "avg_price", "sales", "purch_price"),
+            ("PART-ZERO", "Zero", "EA", 0, 0, 0),
+            ("PART-MISSING", "Missing", "EA", None, 0, None),
+        ])
+        workbook(self.stat, "INITIAL", [
+            ("Reference", None, "TaskCard", None, None, "PN", "Description", "Qty", "Unit", None, "EUR"),
+            ("REF-1", None, "TASK-1", None, None, "PART-ZERO", "Zero", 3, "EA", None, 50),
+            ("REF-2", None, "TASK-2", None, None, "PART-MISSING", "Missing", 2, "EA", None, None),
+        ])
+        config = {
+            "input_files": {"stat": "excel_files/input/STAT_INITIAL - Copy.xlsx",
+                            "amos": "excel_files/input/AMOS_uus_süsteem_info.xlsx",
+                            "uom": "excel_files/input/AMOS_UOM.xlsx"},
+            "output_file": "excel_files/output/STAT_UOM_vordlusraport.xlsx",
+            "stat_columns": {"part_number": 6, "unit": 9, "quantity": 8,
+                             "task_card": 3, "reference": 1},
+            "business_rules": {"historical_sheet": "AVG", "fallback_markup_percent": 20,
+                               "approval_limit_eur": 500, "unit_aliases": {}},
+        }
+        result = process_workbooks(
+            {"stat": self.stat.read_bytes(), "amos": self.amos.read_bytes(),
+             "uom": self.uom.read_bytes()}, config,
+            {"rate": "1.2", "date": "2026-11-20", "status": "TEST"})
+        rows = {row["partno"]: row for row in result["material_calculations"]}
+        zero = rows["PART-ZERO"]
+        self.assertEqual(zero["amos_avg_price_eur"], 0)
+        self.assertEqual(zero["selected_unit_price_eur"], 60)
+        self.assertEqual(zero["final_line_eur"], 180)
+        self.assertEqual(zero["price_source"], "HISTORICAL_PRICE_PLUS_20_PERCENT")
+        self.assertEqual(zero["calculation_status"], "FALLBACK_APPLIED")
+        missing = rows["PART-MISSING"]
+        self.assertIsNone(missing["amos_avg_price_eur"])
+        self.assertEqual(missing["selected_unit_price_eur"], "ANDMED PUUDUVAD")
+        self.assertTrue(missing["review_required"])
+
+    def test_repeated_web_processing_does_not_reuse_previous_work_package(self):
+        config = {
+            "input_files": {"stat": "excel_files/input/STAT_INITIAL - Copy.xlsx",
+                            "amos": "excel_files/input/AMOS_uus_süsteem_info.xlsx",
+                            "uom": "excel_files/input/AMOS_UOM.xlsx"},
+            "output_file": "excel_files/output/STAT_UOM_vordlusraport.xlsx",
+            "stat_columns": {"part_number": 6, "unit": 9, "quantity": 8,
+                             "task_card": 3, "reference": 1},
+            "business_rules": {"historical_sheet": "AVG", "fallback_markup_percent": 20,
+                               "approval_limit_eur": 500, "unit_aliases": {"LT": "L"}},
+        }
+        exchange = {"rate": "1.2", "date": "2026-11-20", "status": "TEST"}
+        first = process_workbooks(
+            {"stat": self.stat.read_bytes(), "amos": self.amos.read_bytes(),
+             "uom": self.uom.read_bytes()}, config, exchange)
+        workbook(self.stat, "INITIAL", [
+            ("Reference", None, "TaskCard", None, None, "PN", None, "Qty", "Unit", None, "EUR"),
+            ("REF-Z", None, "TASK-Z", None, None, "-999-22G1", None, 10, "ME", None, 1),
+        ])
+        second = process_workbooks(
+            {"stat": self.stat.read_bytes(), "amos": self.amos.read_bytes(),
+             "uom": self.uom.read_bytes()}, config, exchange)
+        self.assertEqual(len(first["material_calculations"]), 3)
+        self.assertEqual(len(second["material_calculations"]), 1)
+        self.assertEqual(second["material_calculations"][0]["task_card"], "TASK-Z")
+
+    def test_converter_assets_are_inlined_and_missing_assets_are_nonfatal(self):
+        assets = self.root / "assets"
+        assets.mkdir()
+        self.assertIsNone(load_converter_html(assets))
+        (assets / "unit_converter.html").write_text(
+            '<html><script src="unit_converter.js"></script></html>', encoding="utf-8")
+        (assets / "unit_converter.js").write_text("window.converterLoaded = true;", encoding="utf-8")
+        rendered = load_converter_html(assets)
+        self.assertIn("window.converterLoaded = true;", rendered)
+        self.assertNotIn('src="unit_converter.js"', rendered)

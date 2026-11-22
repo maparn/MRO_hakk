@@ -11,12 +11,26 @@ from openpyxl import load_workbook
 from .sorter import (
     OUTPUT_DEFAULT,
     build_report,
+    parse_physical_price_conversions,
     parse_unit_aliases,
     read_amos_for_stat,
     read_historical_avg,
     read_stat,
     read_uom,
 )
+
+
+def load_converter_html(root: Path) -> str | None:
+    """Load split or legacy converter assets without making the website fatal."""
+    html_path = root / "unit_converter.html"
+    js_path = root / "unit_converter.js"
+    if html_path.is_file() and js_path.is_file():
+        html = html_path.read_text(encoding="utf-8")
+        javascript = js_path.read_text(encoding="utf-8")
+        return html.replace('<script src="unit_converter.js"></script>',
+                            f"<script>{javascript}</script>")
+    legacy = root / "uhikute-konverter.html"
+    return legacy.read_text(encoding="utf-8") if legacy.is_file() else None
 
 
 def _temporary_path(root: Path, configured_path: str) -> Path:
@@ -74,6 +88,8 @@ def process_workbooks(payloads: dict[str, bytes], config: dict, exchange: dict) 
             f"{source}={target}"
             for source, target in rules.get("unit_aliases", {}).items()
         ])
+        physical_conversions = parse_physical_price_conversions(
+            rules.get("approved_physical_price_conversions", []))
         stats = build_report(
             stat_rows, uom_rows, output, columns["part_number"], columns["unit"],
             list(inputs.values()), amos_index=amos_index, historical_avg=historical_avg,
@@ -82,6 +98,7 @@ def process_workbooks(payloads: dict[str, bytes], config: dict, exchange: dict) 
             approval_limit=Decimal(str(rules.get("approval_limit_eur", 500))),
             exchange_rate=Decimal(str(exchange["rate"])),
             exchange_date=exchange["date"], exchange_status=exchange["status"],
+            physical_conversions=physical_conversions,
             project_root=root,
         )
         task_summary = _read_sheet(output, "Task Card Summary")
