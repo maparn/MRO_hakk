@@ -10,7 +10,11 @@
     "unit": 9,
     "quantity": 8,
     "task_card": 3,
-    "reference": 1
+    "reference": 1,
+    "description": 7,
+    "nrc": 4,
+    "factor": 5,
+    "historical_unit_price_eur": 11
   },
   "business_rules": {
     "currency": "EUR",

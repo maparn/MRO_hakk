@@ -14,7 +14,7 @@ from openpyxl import Workbook, load_workbook
 
 from scripts.report_io import literal_cell, save_report, validate_output
 from scripts.exchange_rates import parse_ecb_rate
-from scripts.sorter import build_service_summary, calculate_line
+from scripts.sorter import build_aggregations, calculate_line
 from scripts.web_processing import process_workbooks
 from scripts.uom_rules import annotate_rules
 
@@ -72,10 +72,10 @@ class ReportIntegration(unittest.TestCase):
         ])
         workbook(self.stat, "INITIAL", [
             ("Reference", None, "TaskCard", "NRCNum", "Factor", "PN", "Description",
-             "Qty", "Unit"),
-            (None, None, "TASK-A", None, None, "-999-22G1", None, 1, "ME", "=1+2"),
-            (None, None, "TASK-B", None, None, " paint ", None, 2, "L"),
-            (None, None, "TASK-C", None, None, "PAINT", None, 3, "LT"),
+             "Qty", "Unit", "USD", "EUR"),
+            ("REF-A", None, "TASK-A", None, None, "-999-22G1", None, 1, "ME", 0, 10),
+            ("REF-B", None, "TASK-B", None, None, " paint ", None, 2, "L", 0, 5),
+            ("REF-C", None, "TASK-C", None, None, "PAINT", None, 3, "LT", 0, 6),
         ])
 
     def cli(self, *args, success=True):
@@ -103,13 +103,13 @@ class ReportIntegration(unittest.TestCase):
         decisions = records(self.output / SORT, "STAT decisions")
         self.assertEqual([r["stat_row"] for r in decisions], [2, 3, 4])
         self.assertEqual([r["unit_decision"] for r in decisions],
-                         ["SAME_AMOS_UNIT", "AMBIGUOUS_UNIT_MATCH", "UNIT_NOT_LISTED"])
+                         ["SAME_UNIT", "AMBIGUOUS_UNIT_MATCH", "UNIT_NOT_LISTED"])
         self.assertEqual([r["conversion_approved"] for r in decisions], [True, False, False])
         self.assertEqual([r["stat_quantity"] for r in decisions], [1, 2, 3])
         self.assertEqual([r["task_card"] for r in decisions], ["TASK-A", "TASK-B", "TASK-C"])
         self.assertTrue(all(r["amos_lookup_status"] == "UNIQUE" for r in decisions))
         self.assertEqual(decisions[0]["avg_price"], 1.25)
-        self.assertTrue(all(r["reference"] is None for r in decisions))
+        self.assertEqual([r["reference"] for r in decisions], ["REF-A", "REF-B", "REF-C"])
         for filename in (SORT, FULL):
             self.assertEqual(len(records(self.output / filename, "Vastavused")), 5)
         for path, digest in before.items():
@@ -195,104 +195,136 @@ class ReportIntegration(unittest.TestCase):
         finally:
             book.close()
 
-    def test_zero_avg_price_uses_historical_service_average_plus_twenty_percent(self):
-        book = load_workbook(self.amos)
-        book["Sheet1"]["D3"] = 0
-        book.save(self.amos)
-        book.close()
+    @staticmethod
+    def stat_line(part="PART", unit="EA", quantity=2, historical=10,
+                  reference="REF-1", task_card="TASK-1"):
+        return {
+            "row": 2, "partno": part, "part_key": part.upper(), "unit": unit,
+            "unit_key": unit.upper(), "stat_quantity": quantity,
+            "historical_unit_price_eur": historical, "reference": reference,
+            "task_card": task_card,
+        }
 
-        book = load_workbook(self.stat)
-        avg = book.create_sheet("AVG")
-        avg.append(["TaskCard", "avg"])
-        avg.append(["TASK-B", 100])
-        avg.append(["TASK-C", 200])
-        book.save(self.stat)
-        book.close()
+    def test_identical_units_use_current_amos_price(self):
+        stat = self.stat_line(quantity=3)
+        result = calculate_line(stat, [], {"PART": [{"measure_unit": "EA", "avg_price": 7}]}, {})
+        self.assertEqual(result["line_total_eur"], 21)
+        self.assertEqual(result["price_source"], "AMOS_AVG_PRICE")
+        self.assertEqual(result["conversion_status"], "SAME_UNIT")
 
-        self.cli("scripts/sorter.py", "--amos", self.amos, "--unit-alias", "LT=L",
-                 "--fallback-markup", "20")
-        services = records(self.output / SORT, "Service Summary")
-        by_task = {row["task_card"]: row for row in services}
-        self.assertEqual(by_task["TASK-B"]["final_service_eur"], 120)
-        self.assertEqual(by_task["TASK-C"]["final_service_eur"], 240)
-        self.assertEqual(by_task["SUM_AVG"]["final_service_eur"], 361.25)
-        self.assertEqual(by_task["TASK-B"]["final_price_source"], "OLD_PRICE_PLUS_MARKUP_FALLBACK")
+    def test_zero_current_price_uses_row_historical_price_plus_markup(self):
+        stat = self.stat_line(quantity=3, historical=10)
+        result = calculate_line(stat, [], {"PART": [{"measure_unit": "EA", "avg_price": 0}]}, {},
+                                Decimal("20"))
+        self.assertEqual(result["selected_unit_price_eur"], 12)
+        self.assertEqual(result["line_total_eur"], 36)
+        self.assertEqual(result["price_source"], "HISTORICAL_UNIT_PRICE_PLUS_MARKUP")
+        self.assertEqual(result["fallback_reason"], "AMOS_AVG_PRICE_ZERO")
 
-    def test_service_uses_higher_of_complete_new_and_old_price_without_markup(self):
-        details = [
-            ({"task_card": "NEW-HIGH", "reference": "A"},
-             {"line_total_eur": 120, "calculation_status": "OK", "avg_price_state": "POSITIVE"}),
-            ({"task_card": "OLD-HIGH", "reference": "B"},
-             {"line_total_eur": 80, "calculation_status": "OK", "avg_price_state": "POSITIVE"}),
+    def test_blank_current_price_uses_row_historical_price_plus_markup(self):
+        stat = self.stat_line(quantity=2, historical=15)
+        result = calculate_line(stat, [], {"PART": [{"measure_unit": "EA", "avg_price": None}]}, {},
+                                Decimal("20"))
+        self.assertEqual(result["line_total_eur"], 36)
+        self.assertEqual(result["fallback_reason"], "AMOS_AVG_PRICE_MISSING")
+
+    def test_missing_uom_rule_uses_real_world_row_level_fallback(self):
+        stat = self.stat_line(part="17-4PH/CRES/AMS5643BAR/0.5", unit="MM",
+                              quantity=70, historical=52.86)
+        amos = {stat["part_key"]: [{"measure_unit": "ME", "avg_price": 254.44}]}
+        result = calculate_line(stat, [], amos, {}, Decimal("20"))
+        self.assertAlmostEqual(result["selected_unit_price_eur"], 63.432)
+        self.assertAlmostEqual(result["line_total_eur"], 4440.24)
+        self.assertEqual(result["fallback_reason"], "MISSING_UOM_RULE")
+        self.assertEqual(result["conversion_status"], "NOT_APPLICABLE_FALLBACK")
+
+    def test_missing_uom_and_historical_price_requires_manual_review(self):
+        stat = self.stat_line(unit="MM", historical=None)
+        result = calculate_line(stat, [], {"PART": [{"measure_unit": "ME", "avg_price": 10}]}, {})
+        self.assertIsNone(result["line_total_eur"])
+        self.assertEqual(result["calculation_status"], "MANUAL_REVIEW_MISSING_HISTORICAL_PRICE")
+
+    def test_absent_amos_record_is_not_silently_approved_from_history(self):
+        result = calculate_line(self.stat_line(historical=25), [], {}, {})
+        self.assertIsNone(result["line_total_eur"])
+        self.assertEqual(result["calculation_status"], "MANUAL_REVIEW_AMOS_RECORD_MISSING")
+        self.assertTrue(result["review_required"])
+
+    def test_similar_part_numbers_never_match(self):
+        stat = self.stat_line(part="9MK619321-1")
+        amos = {"9MK619321-10": [{"measure_unit": "EA", "avg_price": 100}]}
+        result = calculate_line(stat, [], amos, {})
+        self.assertEqual(result["calculation_status"], "MANUAL_REVIEW_AMOS_RECORD_MISSING")
+
+    def test_multiple_exact_amos_rows_require_manual_review(self):
+        amos = {"PART": [
+            {"measure_unit": "EA", "avg_price": 10},
+            {"measure_unit": "EA", "avg_price": 11},
+        ]}
+        result = calculate_line(self.stat_line(), [], amos, {})
+        self.assertIsNone(result["line_total_eur"])
+        self.assertEqual(result["calculation_status"], "MANUAL_REVIEW_MULTIPLE_AMOS_RECORDS")
+
+    def test_conflicting_uom_rules_require_manual_review_without_duplication(self):
+        stat = self.stat_line(unit="PACK", quantity=2, historical=10)
+        rules = [
+            {"external": "PACK", "internal": "EA", "rate": 5,
+             "exchange_base": 1, "rule_issues": ("CONFLICTING_UOM_RULES",)},
+            {"external": "PACK", "internal": "EA", "rate": 10,
+             "exchange_base": 1, "rule_issues": ("CONFLICTING_UOM_RULES",)},
         ]
-        rows, total = build_service_summary(
-            details, {"NEW-HIGH": Decimal("100"), "OLD-HIGH": Decimal("100")},
-            Decimal("20"), Decimal("500"), exchange_rate=Decimal("1.25"),
-            exchange_date="2026-11-20", exchange_status="LIVE")
-        by_task = {row[1]: row for row in rows}
-        self.assertEqual(by_task["NEW-HIGH"][7], 120)
-        self.assertEqual(by_task["NEW-HIGH"][8], "NEW_PRICE_HIGHER_OR_EQUAL")
-        self.assertEqual(by_task["OLD-HIGH"][7], 100)
-        self.assertEqual(by_task["OLD-HIGH"][8], "OLD_PRICE_HIGHER")
-        self.assertEqual(by_task["NEW-HIGH"][14], 150)
-        self.assertEqual(total, 220)
+        result = calculate_line(stat, rules, {"PART": [{"measure_unit": "EA", "avg_price": 3}]}, {})
+        self.assertIsNone(result["line_total_eur"])
+        self.assertEqual(result["calculation_status"], "MANUAL_REVIEW_AMBIGUOUS_UOM_RULE")
 
-    def test_approval_limit_flags_but_does_not_cap_price(self):
-        details = [({"task_card": "TASK", "reference": None},
-                    {"line_total_eur": 1000, "calculation_status": "OK",
-                     "avg_price_state": "POSITIVE"})]
-        rows, total = build_service_summary(details, {}, Decimal("20"), Decimal("500"))
-        self.assertEqual(rows[0][7], 1000)
-        self.assertEqual(rows[0][10], "REVIEW_OVER_LIMIT")
-        self.assertEqual(total, 1000)
+    def test_invalid_uom_factor_requires_manual_review(self):
+        stat = self.stat_line(unit="PACK", quantity=2, historical=10)
+        rules = [{"external": "PACK", "internal": "EA", "rate": 0,
+                  "exchange_base": 1, "rule_issues": ("INVALID_UOM_FACTOR",)}]
+        result = calculate_line(stat, rules, {"PART": [{"measure_unit": "EA", "avg_price": 3}]}, {})
+        self.assertIsNone(result["line_total_eur"])
+        self.assertEqual(result["calculation_status"], "MANUAL_REVIEW_INVALID_UOM_FACTOR")
 
-    def test_incomplete_service_keeps_higher_partial_new_price(self):
+    def test_repeated_part_rows_keep_their_own_historical_prices(self):
+        amos = {"PART": [{"measure_unit": "EA", "avg_price": 0}]}
+        first = calculate_line(self.stat_line(quantity=2, historical=10), [], amos, {})
+        second = calculate_line(self.stat_line(quantity=2, historical=30), [], amos, {})
+        self.assertEqual(first["line_total_eur"], 24)
+        self.assertEqual(second["line_total_eur"], 72)
+
+    def test_reference_sum_then_task_card_average(self):
         details = [
-            ({"task_card": "TASK", "reference": "REF"},
-             {"line_total_eur": 141000, "calculation_status": "OK",
-              "avg_price_state": "POSITIVE"}),
-            ({"task_card": "TASK", "reference": None},
-             {"line_total_eur": None, "calculation_status": "AVG_PRICE_ZERO_SERVICE_FALLBACK",
-              "avg_price_state": "ZERO"}),
+            (self.stat_line(reference="REF-A", task_card="TASK", quantity=1),
+             {"line_total_eur": 100, "price_source": "AMOS_AVG_PRICE"}),
+            (self.stat_line(reference="REF-A", task_card="TASK", quantity=1),
+             {"line_total_eur": 50, "price_source": "HISTORICAL_UNIT_PRICE_PLUS_MARKUP"}),
+            (self.stat_line(reference="REF-B", task_card="TASK", quantity=1),
+             {"line_total_eur": 250, "price_source": "AMOS_AVG_PRICE"}),
         ]
-        rows, total = build_service_summary(
-            details, {"TASK": Decimal("2500")}, Decimal("20"), Decimal("500"))
-        self.assertEqual(rows[0][7], 141000)
-        self.assertEqual(rows[0][8], "PARTIAL_NEW_PRICE_HIGHER")
-        self.assertEqual(rows[0][10], "REVIEW_OVER_LIMIT")
-        self.assertEqual(total, 141000)
+        refs, tasks, sum_avg, status = build_aggregations(details, {}, Decimal("1.2"))
+        self.assertEqual([row[7] for row in refs], [150, 250])
+        self.assertEqual(tasks[0][5], 200)
+        self.assertEqual(tasks[0][8], 240)
+        self.assertEqual(sum_avg, 200)
+        self.assertEqual(status, "COMPLETE")
 
-    def test_incomplete_service_uses_marked_up_old_price_when_it_is_higher(self):
+    def test_unresolved_reference_is_not_presented_as_valid_zero(self):
         details = [
-            ({"task_card": "TASK", "reference": "REF"},
-             {"line_total_eur": 100, "calculation_status": "OK",
-              "avg_price_state": "POSITIVE"}),
-            ({"task_card": "TASK", "reference": None},
-             {"line_total_eur": None, "calculation_status": "AMOS_NOT_FOUND",
-              "avg_price_state": None}),
+            (self.stat_line(reference="REF-A", task_card="TASK"),
+             {"line_total_eur": None, "price_source": "MANUAL_REVIEW_REQUIRED"}),
         ]
-        rows, total = build_service_summary(
-            details, {"TASK": Decimal("1000")}, Decimal("20"), Decimal("500"))
-        self.assertEqual(rows[0][7], 1200)
-        self.assertEqual(rows[0][8], "OLD_PRICE_PLUS_MARKUP_FALLBACK")
-        self.assertEqual(total, 1200)
+        refs, tasks, sum_avg, status = build_aggregations(details, {}, Decimal("1.2"))
+        self.assertIsNone(refs[0][7])
+        self.assertIsNone(tasks[0][5])
+        self.assertEqual(sum_avg, 0)
+        self.assertEqual(status, "INCOMPLETE")
 
-    def test_service_with_only_partial_new_price_keeps_it_and_exposes_issue(self):
-        details = [
-            ({"task_card": "TASK", "reference": "REF"},
-             {"line_total_eur": 700, "calculation_status": "OK",
-              "avg_price_state": "POSITIVE"}),
-            ({"task_card": "TASK", "reference": None},
-             {"line_total_eur": None, "calculation_status": "AMOS_NOT_FOUND",
-              "avg_price_state": None}),
-        ]
-        rows, total = build_service_summary(
-            details, {}, Decimal("20"), Decimal("1000"))
-        self.assertEqual(rows[0][7], 700)
-        self.assertEqual(rows[0][8], "PARTIAL_NEW_PRICE_ONLY")
-        self.assertEqual(rows[0][10], "WITHIN_LIMIT")
-        self.assertEqual(rows[0][15], "AMOS_NOT_FOUND")
-        self.assertEqual(total, 700)
+    def test_missing_exchange_rate_keeps_eur_and_leaves_usd_blank(self):
+        details = [(self.stat_line(), {"line_total_eur": 100, "price_source": "AMOS_AVG_PRICE"})]
+        _, tasks, sum_avg, status = build_aggregations(details, {}, None)
+        self.assertEqual(sum_avg, 100)
+        self.assertIsNone(tasks[0][8])
+        self.assertEqual(status, "COMPLETE")
 
     def test_uom_rate_and_exchange_base_are_applied_in_the_documented_direction(self):
         stat = {
@@ -308,7 +340,7 @@ class ReportIntegration(unittest.TestCase):
         self.assertEqual(result["conversion_rate"], 305)
         self.assertEqual(result["conversion_base"], 10)
         self.assertEqual(result["line_total_eur"], 610)
-        self.assertEqual(result["calculation_status"], "OK")
+        self.assertEqual(result["calculation_status"], "CALCULATED_CURRENT_PRICE")
 
     def test_unit_alias_preserves_quantity_before_price_multiplication(self):
         stat = {
@@ -319,33 +351,7 @@ class ReportIntegration(unittest.TestCase):
         self.assertEqual(result["effective_stat_unit"], "L")
         self.assertEqual(result["converted_quantity"], 0.1)
         self.assertAlmostEqual(result["line_total_eur"], 10.609)
-        self.assertEqual(result["conversion_status"], "SAME_UNIT_OR_ALIAS")
-
-    def test_final_price_never_falls_below_an_available_price_candidate(self):
-        cases = [
-            # Complete new price: compare directly with old AVG.
-            (1000, "OK", Decimal("1500"), Decimal("1500")),
-            (2000, "OK", Decimal("1500"), Decimal("2000")),
-            # Incomplete new price: compare it with old AVG + 20%.
-            (1000, "AMOS_NOT_FOUND", Decimal("1500"), Decimal("1800")),
-            (2000, "AMOS_NOT_FOUND", Decimal("1500"), Decimal("2000")),
-        ]
-        for new_price, second_status, old_price, expected in cases:
-            with self.subTest(new_price=new_price, status=second_status, old_price=old_price):
-                details = [
-                    ({"task_card": "TASK", "reference": "REF"},
-                     {"line_total_eur": new_price, "calculation_status": "OK",
-                      "avg_price_state": "POSITIVE"}),
-                ]
-                if second_status != "OK":
-                    details.append((
-                        {"task_card": "TASK", "reference": None},
-                        {"line_total_eur": None, "calculation_status": second_status,
-                         "avg_price_state": None},
-                    ))
-                rows, _ = build_service_summary(
-                    details, {"TASK": old_price}, Decimal("20"), Decimal("5000"))
-                self.assertEqual(Decimal(str(rows[0][7])), expected)
+        self.assertEqual(result["conversion_status"], "UNIT_ALIAS_APPLIED")
 
     def test_ecb_xml_parser_reads_eur_usd_rate_and_date(self):
         payload = b'''<gesmes:Envelope xmlns:gesmes="x" xmlns="y"><Cube><Cube time="2026-11-20">
@@ -378,4 +384,5 @@ class ReportIntegration(unittest.TestCase):
         self.assertEqual(result["filename"], SORT)
         self.assertTrue(result["report"].startswith(b"PK"))
         self.assertEqual(result["summary"][-1]["task_card"], "SUM_AVG")
-        self.assertEqual(result["summary"][-1]["exchange_rate_status"], "TEST")
+        self.assertEqual(result["exchange"]["status"], "TEST")
+        self.assertEqual(len(result["material_calculations"]), 3)

@@ -29,10 +29,10 @@ def _temporary_path(root: Path, configured_path: str) -> Path:
     return path
 
 
-def _read_service_summary(report: Path) -> list[dict]:
+def _read_sheet(report: Path, sheet_name: str) -> list[dict]:
     book = load_workbook(report, read_only=True, data_only=True)
     try:
-        values = book["Service Summary"].iter_rows(values_only=True)
+        values = book[sheet_name].iter_rows(values_only=True)
         headers = next(values)
         return [dict(zip(headers, row)) for row in values]
     finally:
@@ -62,7 +62,9 @@ def process_workbooks(payloads: dict[str, bytes], config: dict, exchange: dict) 
         stat_rows = read_stat(
             inputs["stat"], columns["part_number"], columns["unit"],
             quantity_col=columns["quantity"], task_card_col=columns["task_card"],
-            reference_col=columns["reference"],
+            reference_col=columns["reference"], description_col=columns.get("description", 7),
+            nrc_col=columns.get("nrc", 4), factor_col=columns.get("factor", 5),
+            historical_price_col=columns.get("historical_unit_price_eur", 11),
         )
         uom_rows = read_uom(inputs["uom"])
         amos_index = read_amos_for_stat(inputs["amos"], stat_rows)
@@ -82,11 +84,16 @@ def process_workbooks(payloads: dict[str, bytes], config: dict, exchange: dict) 
             exchange_date=exchange["date"], exchange_status=exchange["status"],
             project_root=root,
         )
-        summary = _read_service_summary(output)
+        task_summary = _read_sheet(output, "Task Card Summary")
+        reference_summary = _read_sheet(output, "Reference Summary")
+        material_calculations = _read_sheet(output, "Material Calculations")
         return {
             "report": output.read_bytes(),
             "filename": OUTPUT_DEFAULT.name,
-            "summary": summary,
+            "summary": task_summary,
+            "task_summary": task_summary,
+            "reference_summary": reference_summary,
+            "material_calculations": material_calculations,
             "stats": stats,
             "exchange": exchange,
         }
