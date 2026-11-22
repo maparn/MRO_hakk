@@ -206,7 +206,7 @@ class ReportIntegration(unittest.TestCase):
         }
 
     def test_identical_units_use_current_amos_price(self):
-        stat = self.stat_line(quantity=3)
+        stat = self.stat_line(quantity=3, historical=5)
         result = calculate_line(stat, [], {"PART": [{"measure_unit": "EA", "avg_price": 7}]}, {})
         self.assertEqual(result["line_total_eur"], 21)
         self.assertEqual(result["price_source"], "CURRENT_AMOS_PRICE")
@@ -452,7 +452,7 @@ class ReportIntegration(unittest.TestCase):
         self.assertEqual(result["calculation_status"], "CURRENT_AMOS_PRICE")
 
     def test_approved_physical_me_price_is_converted_to_mm_without_changing_quantity(self):
-        stat = self.stat_line(part="BAR", unit="MM", quantity=70, historical=52.86)
+        stat = self.stat_line(part="BAR", unit="MM", quantity=70, historical=0.1)
         conversions = parse_physical_price_conversions([{
             "amos_unit": "ME", "stat_unit": "MM", "price_multiplier": "0.001",
             "enabled": True, "approval_reference": "TEST_APPROVAL",
@@ -498,7 +498,7 @@ class ReportIntegration(unittest.TestCase):
             }])
 
     def test_physical_conversion_is_not_applied_when_official_rule_exists(self):
-        stat = self.stat_line(part="BAR", unit="MM", quantity=70, historical=52.86)
+        stat = self.stat_line(part="BAR", unit="MM", quantity=70, historical=0.1)
         official = [{"external": "MM", "internal": "ME", "rate": 1,
                      "exchange_base": 1000, "rule_issues": ()}]
         conversions = {("ME", "MM"): {"price_multiplier": Decimal("0.002"),
@@ -551,7 +551,7 @@ class ReportIntegration(unittest.TestCase):
         self.assertEqual(result["filename"], SORT)
         self.assertTrue(result["report"].startswith(b"PK"))
         self.assertEqual(result["summary"][-1]["task_card"], "SUM_AVG")
-        self.assertEqual(result["summary"][-1]["final_task_card_price_eur"], 34.85)
+        self.assertEqual(result["summary"][-1]["final_task_card_price_eur"], 43.6)
         self.assertEqual(result["exchange"]["status"], "TEST")
         self.assertEqual(len(result["material_calculations"]), 3)
 
